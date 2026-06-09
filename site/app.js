@@ -708,7 +708,8 @@ function setLibraryCollapsed(collapsed, persist = true) {
 }
 
 function restoreLibraryCollapsed() {
-  setLibraryCollapsed(localStorage.getItem(storageKeys.libraryCollapsed) === "true", false);
+  const storedValue = localStorage.getItem(storageKeys.libraryCollapsed);
+  setLibraryCollapsed(storedValue === null ? true : storedValue === "true", false);
 }
 
 function setLibrarySelectionMode(enabled) {
