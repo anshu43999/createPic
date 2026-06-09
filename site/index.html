@@ -576,12 +576,13 @@
     }
 
     .image-frame {
-      --preview-aspect-ratio: 1 / 1;
       position: relative;
-      display: grid;
+      display: flex; /* 改用 Flex 确保内部元素自然居中 */
+      align-items: center;
+      justify-content: center;
       min-height: 0;
       overflow: hidden;
-      place-items: center;
+      isolation: isolate;
       border: 1px solid var(--line);
       border-radius: 8px;
       background:
@@ -592,14 +593,22 @@
       background-size: 24px 24px;
     }
 
-    /* 突破限制，生成的图片自适应填满画布 */
+    /* -------------------------------------------------------------
+       核心修复：使用绝对定位彻底解决高度溢出裁切的问题
+       解除所有 aspect-ratio 和 CSS Grid 的内联绑定冲突
+       ------------------------------------------------------------- */
     .image-frame img {
-      max-width: 92% !important;
-      max-height: 92% !important;
-      width: 100% !important;
-      height: 100% !important;
-      object-fit: contain !important;
-      aspect-ratio: var(--preview-aspect-ratio);
+      position: absolute !important;
+      top: 20px !important;
+      left: 20px !important;
+      width: calc(100% - 40px) !important;
+      height: calc(100% - 40px) !important;
+      max-width: none !important;
+      max-height: none !important;
+      object-fit: contain !important; /* 完美比例缩放 */
+      aspect-ratio: auto !important;  /* 交由 object-fit 自动处理比例，防溢出 */
+      z-index: 1; /* 保证居于操作按钮之下 */
+      pointer-events: none;
     }
 
     .empty-preview {
@@ -608,6 +617,8 @@
       place-items: center;
       color: var(--muted);
       text-align: center;
+      z-index: 1;
+      pointer-events: none;
     }
 
     .empty-preview strong {
@@ -619,6 +630,7 @@
       position: absolute;
       top: 50%;
       z-index: 2;
+      pointer-events: auto;
       width: 42px;
       height: 42px;
       color: #fff;
@@ -631,11 +643,17 @@
 
     .preview-prev { left: 14px; }
     .preview-next { right: 14px; }
+
+    .preview-nav:active:not(:disabled) {
+      transform: translateY(-50%) scale(0.97);
+    }
+
     .preview-group-label {
       position: absolute;
       top: 14px;
       right: 14px;
       z-index: 2;
+      pointer-events: none;
     }
 
     /* 悬浮态信息栏改为轻量化的右下角显示 */
@@ -653,6 +671,8 @@
       color: #fff;
       background: rgba(10, 25, 30, 0.4);
       backdrop-filter: blur(14px);
+      z-index: 2;
+      pointer-events: none;
     }
     .image-meta strong { color: #fff; }
 
@@ -738,6 +758,22 @@
       box-shadow: 0 8px 24px rgba(10, 108, 116, 0.08);
       border-color: rgba(10, 108, 116, 0.25);
       z-index: 1;
+    }
+
+    .batch-card.is-active {
+      border-color: var(--accent);
+      background:
+        linear-gradient(180deg, rgba(10, 108, 116, 0.12), rgba(255, 255, 255, 0.84));
+      box-shadow: 0 0 0 3px rgba(10, 108, 116, 0.14), 0 12px 28px rgba(10, 108, 116, 0.12);
+    }
+
+    .batch-card.is-active:hover {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(10, 108, 116, 0.18), 0 14px 32px rgba(10, 108, 116, 0.14);
+    }
+
+    .batch-card.is-active .batch-title strong {
+      color: var(--accent);
     }
 
     .asset-item.is-selected {

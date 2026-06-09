@@ -1363,6 +1363,15 @@ function updateBatchItem(batchId, itemId, updates = {}) {
     activePreviewGroup.items = getBatchPreviewItems(batch);
     activePreviewGroup.index = Math.min(activePreviewGroup.index, Math.max(0, activePreviewGroup.items.length - 1));
     updatePreviewGroupControls();
+  } else if (updates.image && !activePreviewGroup.batchId) {
+    const items = getBatchPreviewItems(batch);
+    const preferredIndex = items.findIndex((entry) => sameAssetImage(entry.image, updates.image));
+    activePreviewGroup = {
+      batchId,
+      index: preferredIndex >= 0 ? preferredIndex : 0,
+      items
+    };
+    updatePreviewGroupControls();
   }
   renderBatchHistory();
   scheduleWorkspaceDraftSave();
