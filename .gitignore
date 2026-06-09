@@ -1,0 +1,26 @@
+.tmp/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment
+.env
+.env.*
+
+# Dependency/cache directories
+node_modules/
+.npm-cache/
+
+# Build/output artifacts
+dist/
+build/
+coverage/
