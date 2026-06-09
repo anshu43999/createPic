@@ -1,0 +1,10 @@
+services:
+  image-page:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: createpic-image-page:latest
+    container_name: createpic-image-page
+    restart: unless-stopped
+    ports:
+      - "8080:80"
