@@ -102,7 +102,7 @@
     /* 释放整体宽度，允许界面拉伸至超大带鱼屏尺寸 */
     .app-shell {
       display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
       width: calc(100% - 40px); /* 左右仅保留 20px 边距 */
       max-width: 2400px;
       height: 100vh;
@@ -113,7 +113,6 @@
     }
 
     .topbar,
-    .status-strip,
     .panel,
     .stage-panel {
       border: 1px solid var(--line);
@@ -123,12 +122,11 @@
     }
 
     .topbar {
-      display: flex;
+      display: grid;
+      grid-template-columns: auto minmax(360px, 1fr) auto;
       align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      min-height: 78px;
-      padding: 14px 16px;
+      gap: 14px;
+      padding: 10px 14px;
       border-radius: 8px;
     }
 
@@ -222,7 +220,7 @@
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 1px;
-      margin-top: 12px;
+      min-width: 0;
       overflow: hidden;
       border-radius: 8px;
       background: var(--line);
@@ -230,20 +228,20 @@
 
     .status-strip div {
       display: grid;
-      gap: 4px;
-      padding: 12px 14px;
+      gap: 3px;
+      padding: 8px 10px;
       background: rgba(255, 255, 255, 0.85); /* 冷色底 */
     }
 
     .status-strip span {
       color: var(--muted);
-      font-size: 12px;
+      font-size: 11px;
     }
 
     .status-strip strong {
       min-width: 0;
       overflow: hidden;
-      font-size: 15px;
+      font-size: 14px;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
@@ -937,7 +935,10 @@
       .result-column {
         min-height: 800px;
       }
-      .topbar, .stage-header {
+      .topbar {
+        grid-template-columns: 1fr;
+      }
+      .stage-header {
         align-items: stretch;
         flex-direction: column;
       }
@@ -963,30 +964,29 @@
           <p>TokensKingdom Image Studio</p>
         </div>
       </div>
+      <section class="status-strip" aria-label="工作台状态">
+        <div>
+          <span>模型</span>
+          <strong id="status-model">gpt-image-2</strong>
+        </div>
+        <div>
+          <span>画幅</span>
+          <strong id="status-size">接口默认</strong>
+        </div>
+        <div>
+          <span>队列</span>
+          <strong id="status-queue">0 个任务</strong>
+        </div>
+        <div>
+          <span>接口</span>
+          <strong id="status-api">未连接</strong>
+        </div>
+      </section>
       <div class="top-actions">
         <button class="secondary-action" type="button" id="download-all">下载全部</button>
         <button class="primary-action" type="button" id="top-generate">生成</button>
       </div>
     </header>
-
-    <section class="status-strip" aria-label="工作台状态">
-      <div>
-        <span>模型</span>
-        <strong id="status-model">gpt-image-2</strong>
-      </div>
-      <div>
-        <span>画幅</span>
-        <strong id="status-size">接口默认</strong>
-      </div>
-      <div>
-        <span>队列</span>
-        <strong id="status-queue">0 个任务</strong>
-      </div>
-      <div>
-        <span>接口</span>
-        <strong id="status-api">未连接</strong>
-      </div>
-    </section>
 
     <section class="workbench" aria-label="生图工作台">
       <aside class="panel controls-panel">
