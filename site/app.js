@@ -2983,12 +2983,6 @@ async function deleteBatch(batchId) {
     return;
   }
 
-  const hasUnfinishedItems = (batch.items || []).some((item) => ["queued", "running"].includes(item.state));
-  if (hasUnfinishedItems) {
-    showToast("生成中的批次暂时不能删除", "error");
-    return;
-  }
-
   const images = getDirectBatchPreviewItems(batch).map((item) => item.image).filter(Boolean);
   const message = images.length
     ? `确认删除这个批次和关联的 ${images.length} 张作品？`
