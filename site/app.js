@@ -31,6 +31,11 @@ let historySyncPromise = null;
 let librarySelectionMode = false;
 let queueExpanded = false;
 let activePreviewGroup = { batchId: "", index: 0, items: [] };
+let editBrushEnabled = true;
+let editBrushDrawing = false;
+let editHasMarks = false;
+let editLastPoint = null;
+let editReferencePreviewUrl = "";
 const selectedAssetImages = new Set();
 const expandedBatchIds = new Set();
 
@@ -60,6 +65,7 @@ const queueList = $("#queue-list");
 const removeFailedQueue = $("#remove-failed-queue");
 const removeDoneQueue = $("#remove-done-queue");
 const clearQueue = $("#clear-queue");
+const retryFailedQueue = $("#retry-failed-queue");
 const queueToggle = $("#toggle-queue-list");
 const widthInput = $("#width");
 const heightInput = $("#height");
@@ -79,6 +85,16 @@ const promptInput = $("#prompt");
 const promptLabel = $("#prompt-label");
 const promptScore = $("#prompt-score");
 const blankCanvas = $("#blank-canvas");
+const openEditorButton = $("#open-editor");
+const editModal = $("#edit-modal");
+const editPreviewImage = $("#edit-preview-image");
+const editDrawCanvas = $("#edit-draw-canvas");
+const editPromptInput = $("#edit-prompt");
+const closeEditorButton = $("#close-editor");
+const toggleBrushButton = $("#toggle-brush");
+const clearBrushButton = $("#clear-brush");
+const useAsReferenceButton = $("#use-as-reference");
+const generateEditButton = $("#generate-edit");
 const previewPrev = $("#preview-prev");
 const previewNext = $("#preview-next");
 const previewGroupLabel = $("#preview-group-label");
@@ -537,12 +553,14 @@ function updateStatus() {
     queueToggle.hidden = queueList.children.length <= 5;
     queueToggle.textContent = queueExpanded ? "收起队列" : `展开全部 ${queueList.children.length}`;
   }
+  updateQueueRetryControls();
   $("#asset-list").classList.toggle("empty", $("#asset-list").children.length === 0);
   updateLibrarySelectionUi();
   if (variantStrip) {
     variantStrip.classList.toggle("empty", variantStrip.children.length === 0);
   }
   updatePreviewAspectRatio(previewResolution);
+  updateEditorAvailability();
   scheduleWorkspaceDraftSave();
 }
 
@@ -634,6 +652,344 @@ function updateReferencePreview(src = "") {
     : "图生图会以这张图作为主体、风格或构图依据";
 }
 
+function getActiveImageForEdit() {
+  const previewSource = mainPreview.currentSrc || mainPreview.getAttribute("src") || mainPreview.src || "";
+  if (mainPreview.hidden || !previewSource) {
+    return "";
+  }
+  return sanitizeImageSource(state.activeImage) || sanitizeImageSource(previewSource);
+}
+
+function updateEditorAvailability() {
+  if (!openEditorButton) {
+    return;
+  }
+  const hasEditableImage = Boolean(getActiveImageForEdit());
+  openEditorButton.disabled = !hasEditableImage;
+  openEditorButton.setAttribute("aria-disabled", hasEditableImage ? "false" : "true");
+}
+
+function revokeEditReferencePreviewUrl() {
+  if (editReferencePreviewUrl) {
+    URL.revokeObjectURL(editReferencePreviewUrl);
+    editReferencePreviewUrl = "";
+  }
+}
+
+function resizeEditCanvas() {
+  if (!editDrawCanvas || !editPreviewImage || !editPreviewImage.src) {
+    return;
+  }
+
+  const imageRect = editPreviewImage.getBoundingClientRect();
+  const wrapRect = editPreviewImage.parentElement.getBoundingClientRect();
+  if (!imageRect.width || !imageRect.height) {
+    return;
+  }
+
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(imageRect.width * ratio));
+  const height = Math.max(1, Math.round(imageRect.height * ratio));
+  if (editDrawCanvas.width !== width || editDrawCanvas.height !== height) {
+    const previous = document.createElement("canvas");
+    previous.width = editDrawCanvas.width || width;
+    previous.height = editDrawCanvas.height || height;
+    previous.getContext("2d").drawImage(editDrawCanvas, 0, 0);
+    editDrawCanvas.width = width;
+    editDrawCanvas.height = height;
+    if (editHasMarks) {
+      editDrawCanvas.getContext("2d").drawImage(previous, 0, 0, width, height);
+    }
+  }
+
+  editDrawCanvas.style.left = `${imageRect.left - wrapRect.left}px`;
+  editDrawCanvas.style.top = `${imageRect.top - wrapRect.top}px`;
+  editDrawCanvas.style.width = `${imageRect.width}px`;
+  editDrawCanvas.style.height = `${imageRect.height}px`;
+}
+
+function clearEditMarks() {
+  if (!editDrawCanvas) {
+    return;
+  }
+  const ctx = editDrawCanvas.getContext("2d");
+  ctx.clearRect(0, 0, editDrawCanvas.width, editDrawCanvas.height);
+  editHasMarks = false;
+  editLastPoint = null;
+}
+
+function setEditBrushEnabled(enabled) {
+  editBrushEnabled = Boolean(enabled);
+  if (toggleBrushButton) {
+    toggleBrushButton.classList.toggle("active", editBrushEnabled);
+    toggleBrushButton.setAttribute("aria-pressed", editBrushEnabled ? "true" : "false");
+  }
+  if (editDrawCanvas) {
+    editDrawCanvas.classList.toggle("is-disabled", !editBrushEnabled);
+  }
+}
+
+function editCanvasPoint(event) {
+  const rect = editDrawCanvas.getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  return {
+    x: (event.clientX - rect.left) * ratio,
+    y: (event.clientY - rect.top) * ratio
+  };
+}
+
+function drawEditStroke(from, to) {
+  const ctx = editDrawCanvas.getContext("2d");
+  const ratio = window.devicePixelRatio || 1;
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 5 * ratio;
+  ctx.strokeStyle = "rgba(255, 42, 64, 0.92)";
+  ctx.shadowColor = "rgba(255, 255, 255, 0.9)";
+  ctx.shadowBlur = 2 * ratio;
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x, to.y);
+  ctx.stroke();
+  ctx.restore();
+  editHasMarks = true;
+}
+
+function beginEditDraw(event) {
+  if (!editBrushEnabled || !editDrawCanvas) {
+    return;
+  }
+  event.preventDefault();
+  resizeEditCanvas();
+  editBrushDrawing = true;
+  editLastPoint = editCanvasPoint(event);
+  editDrawCanvas.setPointerCapture?.(event.pointerId);
+}
+
+function moveEditDraw(event) {
+  if (!editBrushDrawing || !editLastPoint) {
+    return;
+  }
+  event.preventDefault();
+  const next = editCanvasPoint(event);
+  drawEditStroke(editLastPoint, next);
+  editLastPoint = next;
+}
+
+function endEditDraw(event) {
+  if (!editBrushDrawing) {
+    return;
+  }
+  editBrushDrawing = false;
+  editLastPoint = null;
+  editDrawCanvas.releasePointerCapture?.(event.pointerId);
+}
+
+function openImageEditor() {
+  const image = getActiveImageForEdit();
+  if (!image) {
+    showToast("请先选择一张图片", "error");
+    return;
+  }
+  editPreviewImage.src = image;
+  clearEditMarks();
+  setEditBrushEnabled(true);
+  editPromptInput.value = promptInput.value.trim()
+    || "基于当前图片继续修改，保留主体结构和主要风格，只调整需要变化的部分。";
+  editModal.hidden = false;
+  document.body.classList.add("modal-open");
+  window.setTimeout(() => {
+    resizeEditCanvas();
+    editPromptInput.focus();
+  }, 0);
+}
+
+function closeImageEditor() {
+  if (!editModal) {
+    return;
+  }
+  editModal.hidden = true;
+  document.body.classList.remove("modal-open");
+  editBrushDrawing = false;
+  editLastPoint = null;
+}
+
+async function imageBlobFromUrl(imageUrl, { timeoutMs = 20000 } = {}) {
+  const safeImage = sanitizeImageSource(imageUrl);
+  if (!safeImage) {
+    throw new Error("当前图片地址不安全，无法作为参考图");
+  }
+
+  if (safeImage.startsWith("data:image/")) {
+    const file = dataUrlToFile(safeImage, "reference.png");
+    return { blob: file, safeImage };
+  }
+
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : 0;
+  let response;
+  try {
+    response = await fetch(safeImage, controller ? { signal: controller.signal } : undefined);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("参考图读取超时，请稍后重试");
+    }
+    throw error;
+  } finally {
+    if (timer) {
+      window.clearTimeout(timer);
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`参考图读取失败：${response.status}`);
+  }
+  const blob = await response.blob();
+  if (!blob.type.startsWith("image/")) {
+    throw new Error("当前图片无法作为参考图");
+  }
+  return { blob, safeImage };
+}
+
+function blobFromCanvas(canvas, type = "image/png", quality = 0.95) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob);
+      } else {
+        reject(new Error("标注图片导出失败"));
+      }
+    }, type, quality);
+  });
+}
+
+function imageElementFromBlob(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("参考图读取失败"));
+    };
+    image.src = url;
+  });
+}
+
+async function drawableImageFromBlob(blob) {
+  if (window.createImageBitmap) {
+    const bitmap = await createImageBitmap(blob);
+    return {
+      image: bitmap,
+      width: bitmap.width,
+      height: bitmap.height,
+      dispose: () => bitmap.close?.()
+    };
+  }
+
+  const image = await imageElementFromBlob(blob);
+  return {
+    image,
+    width: image.naturalWidth || image.width,
+    height: image.naturalHeight || image.height,
+    dispose: () => {}
+  };
+}
+
+async function buildMarkedReferenceBlob(imageUrl) {
+  const { blob, safeImage } = await imageBlobFromUrl(imageUrl);
+  if (!editHasMarks || !editDrawCanvas) {
+    return { blob, safeImage, marked: false };
+  }
+
+  const drawable = await drawableImageFromBlob(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = drawable.width;
+  canvas.height = drawable.height;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(drawable.image, 0, 0);
+  ctx.drawImage(editDrawCanvas, 0, 0, canvas.width, canvas.height);
+  drawable.dispose();
+  const markedBlob = await blobFromCanvas(canvas);
+  return { blob: markedBlob, safeImage, marked: true };
+}
+
+async function useCurrentImageAsReference({ announce = true, includeMarks = false } = {}) {
+  const image = getActiveImageForEdit();
+  if (!image) {
+    showToast("请先选择一张图片", "error");
+    return false;
+  }
+
+  try {
+    const { blob, safeImage, marked } = includeMarks
+      ? await buildMarkedReferenceBlob(image)
+      : await imageBlobFromUrl(image);
+    const extension = blob.type.split("/")[1] || "png";
+    const name = `reference.${extension}`;
+    state.referenceImage = {
+      file: new File([blob], name, { type: blob.type }),
+      name
+    };
+
+    revokeEditReferencePreviewUrl();
+    const preview = marked ? URL.createObjectURL(blob) : safeImage;
+    if (marked) {
+      editReferencePreviewUrl = preview;
+    }
+    state.referenceDraft = {
+      kind: marked || preview.startsWith("blob:") ? "object" : preview.startsWith("data:image/") ? "data" : "url",
+      url: marked ? "" : safeImage,
+      preview,
+      name,
+      type: blob.type
+    };
+    referenceUrlInput.value = marked ? "" : safeImage;
+    updateReferencePreview(preview);
+    state.mode = "image";
+    activateByDataset("[data-mode]", "mode", "image");
+    updateModeUi();
+    updateStatus();
+    scheduleWorkspaceDraftSave();
+    if (announce) {
+      showToast(marked ? "已把标注图设为参考图" : "已把当前图设为参考图");
+    }
+    return true;
+  } catch (error) {
+    showToast(error.message || "参考图设置失败", "error");
+    return false;
+  }
+}
+
+async function generateEditFromCurrentImage() {
+  if (isGenerationBusy()) {
+    showToast("当前正在生成，请稍后再编辑", "error");
+    return;
+  }
+
+  const nextPrompt = editPromptInput.value.trim();
+  if (!nextPrompt) {
+    showToast("请先输入修改提示词", "error");
+    editPromptInput.focus();
+    return;
+  }
+
+  const ready = await useCurrentImageAsReference({ announce: false, includeMarks: true });
+  if (!ready) {
+    return;
+  }
+
+  promptInput.value = editHasMarks
+    ? `${nextPrompt}\n\n红色画笔标记的是需要重点修改的位置。最终成图不要保留红色标记、圈线或涂鸦。`
+    : nextPrompt;
+  closeImageEditor();
+  showToast("已进入图生图，开始生成修改版");
+  generateImage();
+}
+
 function updateBoardUi(name = getActiveBoard()) {
   const preset = boardUiPresets[name] || boardUiPresets.commerce;
   const isFreePrompt = Boolean(preset.freePrompt);
@@ -693,6 +1049,7 @@ function setBusy(isBusy) {
     button.disabled = isBusy;
     button.classList.toggle("loading", isBusy);
   });
+  updateQueueRetryControls();
 }
 
 function setLibraryCollapsed(collapsed, persist = true) {
@@ -708,8 +1065,7 @@ function setLibraryCollapsed(collapsed, persist = true) {
 }
 
 function restoreLibraryCollapsed() {
-  const storedValue = localStorage.getItem(storageKeys.libraryCollapsed);
-  setLibraryCollapsed(storedValue === null ? true : storedValue === "true", false);
+  setLibraryCollapsed(false, false);
 }
 
 function setLibrarySelectionMode(enabled) {
@@ -1057,6 +1413,7 @@ function selectImageFromData({ image, title, resolution }, options = {}) {
   $$(".asset-item").forEach((item) => {
     item.classList.toggle("active", sameAssetImage(item.dataset.image, safeImage));
   });
+  updateEditorAvailability();
   scheduleWorkspaceDraftSave();
 }
 
@@ -1144,6 +1501,56 @@ function formatNoteText(note = "") {
   return clean ? `备注：${clean}` : "";
 }
 
+function getQueueRetryContext(item) {
+  if (!item) {
+    return null;
+  }
+
+  const requestPrompt = String(item.dataset.requestPrompt || "").trim();
+  if (!requestPrompt) {
+    return null;
+  }
+
+  return {
+    mode: item.dataset.mode === "image" ? "image" : "text",
+    requestPrompt,
+    quality: String(item.dataset.requestQuality || "").trim(),
+    title: String(item.dataset.title || "生成任务"),
+    batchId: String(item.dataset.batchId || ""),
+    batchItemId: String(item.dataset.batchItemId || ""),
+    requestId: String(item.dataset.requestId || ""),
+    target: {
+      width: Number(item.dataset.targetWidth) || 0,
+      height: Number(item.dataset.targetHeight) || 0,
+      label: String(item.dataset.targetLabel || "").trim()
+    }
+  };
+}
+
+function updateQueueRetryUi(item) {
+  if (!item) {
+    return;
+  }
+
+  const retryButton = item.querySelector(".queue-retry-button");
+  if (!retryButton) {
+    return;
+  }
+
+  const retryContext = getQueueRetryContext(item);
+  const canRetry = item.classList.contains("failed") && Boolean(retryContext);
+  retryButton.hidden = !canRetry;
+  retryButton.disabled = !canRetry || isGenerationBusy();
+}
+
+function updateQueueRetryControls() {
+  const retryableItems = $$(".queue-item").filter((item) => item.classList.contains("failed") && getQueueRetryContext(item));
+  if (retryFailedQueue) {
+    retryFailedQueue.disabled = retryableItems.length === 0 || isGenerationBusy();
+  }
+  $$(".queue-item").forEach(updateQueueRetryUi);
+}
+
 function createQueueItem({
   title,
   status = "请求中",
@@ -1155,7 +1562,13 @@ function createQueueItem({
   batchId = "",
   batchItemId = "",
   requestId = "",
-  note = ""
+  note = "",
+  mode = state.mode,
+  targetWidth = 0,
+  targetHeight = 0,
+  targetLabel = "",
+  requestPrompt = "",
+  requestQuality = ""
 }) {
   const item = document.createElement("div");
   item.className = "queue-item";
@@ -1169,16 +1582,26 @@ function createQueueItem({
   item.dataset.status = status || "请求中";
   item.dataset.createdAt = String(createdAt || Date.now());
   item.dataset.note = String(note || "").slice(0, 120);
+  item.dataset.mode = mode === "image" ? "image" : "text";
+  item.dataset.targetWidth = String(Number(targetWidth) || 0);
+  item.dataset.targetHeight = String(Number(targetHeight) || 0);
+  item.dataset.targetLabel = String(targetLabel || "").slice(0, 80);
+  item.dataset.requestPrompt = String(requestPrompt || "").slice(0, 5000);
+  item.dataset.requestQuality = String(requestQuality || "").slice(0, 20);
   item.innerHTML = `
     <div class="queue-item-main">
       <strong>${escapeHtml(item.dataset.title)}</strong>
-      <span class="queue-status">${escapeHtml(item.dataset.status)}</span>
-      <button class="queue-note-button" type="button" data-queue-action="note">备注</button>
+      <div class="queue-item-actions">
+        <span class="queue-status">${escapeHtml(item.dataset.status)}</span>
+        <button class="queue-retry-button" type="button" data-queue-action="retry">重试</button>
+        <button class="queue-note-button" type="button" data-queue-action="note">备注</button>
+      </div>
     </div>
     <small class="queue-note" ${item.dataset.note ? "" : "hidden"}>${escapeHtml(formatNoteText(item.dataset.note))}</small>
     <progress max="100"></progress>
   `;
   item.querySelector("progress").value = Number(progress) || 0;
+  updateQueueRetryUi(item);
   return item;
 }
 
@@ -1207,6 +1630,7 @@ function updateQueueJobStatus(item, status, progress = null) {
   item.dataset.status = status;
   item.dataset.failed = "false";
   item.dataset.done = "false";
+  updateQueueRetryUi(item);
   scheduleWorkspaceDraftSave();
 }
 
@@ -1225,6 +1649,7 @@ function finishQueueJob(item, status, failed = false) {
   item.dataset.status = status;
   item.dataset.failed = failed ? "true" : "false";
   item.dataset.done = failed ? "false" : "true";
+  updateQueueRetryUi(item);
   scheduleWorkspaceDraftSave();
 }
 
@@ -1270,6 +1695,173 @@ function clearQueueItems() {
   updateStatus();
   scheduleWorkspaceDraftSave();
   showToast(`已清空队列 ${count} 个`);
+}
+
+async function retryFailedQueueItems() {
+  const items = $$(".queue-item").filter((item) => item.classList.contains("failed") && getQueueRetryContext(item));
+  if (!items.length) {
+    showToast("没有可重试的失败任务");
+    return;
+  }
+
+  if (isGenerationBusy()) {
+    showToast("生成中，请等待当前任务完成", "error");
+    return;
+  }
+
+  const apiReady = await ensureApiReadyForGeneration();
+  if (!apiReady) {
+    return;
+  }
+
+  const needsReference = items.some((item) => getQueueRetryContext(item)?.mode === "image");
+  if (needsReference) {
+    const hasReference = await ensureReferenceImageReady();
+    if (!hasReference) {
+      showToast("图生图重试需要先恢复或重新选择参考图", "error");
+      return;
+    }
+  }
+
+  setBusy(true);
+  resultStateLabel.textContent = items.length > 1 ? "重试失败任务中" : "重试任务中";
+  const summary = { success: 0, failed: 0 };
+  for (const item of items) {
+    const ok = await retryQueueItem(item, { keepBusy: true, silentSummary: true });
+    if (ok) {
+      summary.success += 1;
+    } else {
+      summary.failed += 1;
+    }
+  }
+  setBusy(false);
+  resultStateLabel.textContent = summary.failed
+    ? summary.success ? "部分重试完成" : "重试失败"
+    : "重试完成";
+  showToast(
+    summary.failed
+      ? `重试完成：成功 ${summary.success} 个，失败 ${summary.failed} 个`
+      : `已重试成功 ${summary.success} 个`,
+    summary.failed ? "error" : undefined
+  );
+  updateStatus();
+}
+
+async function retryQueueItem(item, options = {}) {
+  if (!item) {
+    return false;
+  }
+
+  if (!item.classList.contains("failed")) {
+    showToast("只有失败任务可以重试");
+    return false;
+  }
+
+  if (!options.keepBusy && isGenerationBusy()) {
+    showToast("生成中，请等待当前任务完成", "error");
+    return false;
+  }
+
+  const context = getQueueRetryContext(item);
+  if (!context) {
+    showToast("这个任务缺少重试参数，请重新生成", "error");
+    return false;
+  }
+
+  const apiReady = await ensureApiReadyForGeneration();
+  if (!apiReady) {
+    return false;
+  }
+
+  if (context.mode === "image") {
+    const hasReference = await ensureReferenceImageReady();
+    if (!hasReference) {
+      showToast("图生图重试需要先恢复或重新选择参考图", "error");
+      return false;
+    }
+  }
+
+  if (!options.keepBusy) {
+    setBusy(true);
+  }
+
+  const requestId = `retry-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  item.dataset.requestId = requestId;
+  updateBatchItem(context.batchId, context.batchItemId, {
+    requestId,
+    state: "running",
+    status: "重试中"
+  });
+  updateQueueJobStatus(item, "重试中", 35);
+  resultStateLabel.textContent = "重试中";
+
+  try {
+    const response = context.mode === "image"
+      ? await generateImageEdit(context.requestPrompt, context.target, {
+        batchId: context.batchId,
+        batchItemId: context.batchItemId,
+        requestId
+      }, { promptReady: true, quality: context.quality })
+      : await generateImageFromText(context.requestPrompt, context.target, {
+        batchId: context.batchId,
+        batchItemId: context.batchItemId,
+        requestId
+      }, { promptReady: true, quality: context.quality });
+
+    const images = extractImages(response);
+    const imageUrl = await resolveFirstLoadableImage(images);
+    if (!imageUrl) {
+      throw new Error(buildNoImageError(response));
+    }
+
+    state.generatedCount += 1;
+    const resolution = formatResolution(context.target.width, context.target.height) || "接口默认";
+    const asset = addGeneratedAsset({
+      image: imageUrl,
+      title: context.title,
+      resolution,
+      meta: `${context.mode === "image" ? "图生图" : "文生图"} / 重试 / ${context.target.label || "接口默认"}`,
+      clientBatchId: context.batchId,
+      clientItemId: context.batchItemId,
+      clientRequestId: requestId,
+      targetWidth: context.target.width,
+      targetHeight: context.target.height
+    });
+    selectImageFromData(asset || { image: imageUrl, title: context.title, resolution });
+    updateBatchItem(context.batchId, context.batchItemId, {
+      state: "done",
+      status: "重试完成",
+      image: imageUrl,
+      title: context.title,
+      resolution
+    });
+    finishQueueJob(item, "重试完成");
+    if (!options.silentSummary) {
+      showToast("重试完成");
+    }
+    return true;
+  } catch (error) {
+    updateBatchItem(context.batchId, context.batchItemId, {
+      state: "failed",
+      status: shortError(error.message)
+    });
+    if (isAuthError(error)) {
+      statusApi.textContent = "Key无效";
+      statusApi.classList.remove("ok");
+    }
+    finishQueueJob(item, `重试失败：${shortError(error.message)}`, true);
+    resultStateLabel.textContent = "重试失败";
+    if (!options.silentSummary) {
+      showToast(`重试失败：${shortError(error.message)}`, "error");
+    }
+    console.warn("Image generation retry failed:", error.message);
+    return false;
+  } finally {
+    if (!options.keepBusy) {
+      setBusy(false);
+    }
+    updateStatus();
+  }
 }
 
 function editQueueItemNote(item) {
@@ -1675,6 +2267,8 @@ async function generateImage() {
 
   const targets = getGenerationTargets();
   const batchStart = state.generatedCount;
+  const requestPrompt = buildPrompt(finalPrompt);
+  const requestQuality = mapQuality();
   const batch = createGenerationBatch(finalPrompt, targets);
   const jobs = targets.map((target, index) => {
     const title = `${promptInput.value.trim().slice(0, 10) || "生成作品"} #${batchStart + index + 1}`;
@@ -1688,7 +2282,13 @@ async function generateImage() {
       item: addQueueJob(targets.length > 1 ? `${title} · ${target.label}` : title, {
         batchId: batch.id,
         batchItemId: batchItem.id || "",
-        requestId: batchItem.requestId || ""
+        requestId: batchItem.requestId || "",
+        mode: state.mode,
+        targetWidth: target.width,
+        targetHeight: target.height,
+        targetLabel: target.label,
+        requestPrompt,
+        requestQuality
       })
     };
   });
@@ -1827,12 +2427,12 @@ async function runConcurrent(items, limit, worker) {
   await Promise.all(workers);
 }
 
-async function generateImageFromText(prompt, target, trace = {}) {
+async function generateImageFromText(prompt, target, trace = {}, options = {}) {
   const size = resolveProviderSize(target.width, target.height);
   const body = {
     model: getImageModel(),
-    prompt: buildPrompt(prompt),
-    quality: mapQuality(),
+    prompt: options.promptReady ? prompt : buildPrompt(prompt),
+    quality: options.quality || mapQuality(),
     n: 1
   };
   if (size) {
@@ -1850,15 +2450,15 @@ async function generateImageFromText(prompt, target, trace = {}) {
   });
 }
 
-async function generateImageEdit(prompt, target, trace = {}) {
+async function generateImageEdit(prompt, target, trace = {}, options = {}) {
   const size = resolveProviderSize(target.width, target.height);
   const form = new FormData();
   form.append("model", getImageModel());
-  form.append("prompt", buildPrompt(prompt));
+  form.append("prompt", options.promptReady ? prompt : buildPrompt(prompt));
   if (size) {
     form.append("size", size);
   }
-  form.append("quality", mapQuality());
+  form.append("quality", options.quality || mapQuality());
   form.append("n", "1");
   form.append("image", state.referenceImage.file, state.referenceImage.name);
 
@@ -3137,6 +3737,7 @@ function clearMainPreview() {
   resultStateLabel.textContent = "等待生成";
   setDisplayedResolution();
   $$(".asset-item, .variant-card").forEach((item) => item.classList.remove("active"));
+  updateEditorAvailability();
 }
 
 function selectBlankCanvas() {
@@ -3405,6 +4006,12 @@ function getPersistableQueueDraft() {
       title: item.dataset.title || item.querySelector("strong")?.textContent || "生成任务",
       status: item.dataset.status || item.querySelector(".queue-status")?.textContent || "请求中",
       note: item.dataset.note || "",
+      mode: item.dataset.mode || "text",
+      targetWidth: Number(item.dataset.targetWidth) || 0,
+      targetHeight: Number(item.dataset.targetHeight) || 0,
+      targetLabel: item.dataset.targetLabel || "",
+      requestPrompt: item.dataset.requestPrompt || "",
+      requestQuality: item.dataset.requestQuality || "",
       failed: item.classList.contains("failed"),
       done: item.classList.contains("done"),
       progress: Number(item.querySelector("progress")?.value) || 0,
@@ -3581,6 +4188,7 @@ function getPersistableReferenceDraft() {
 }
 
 function restoreReferenceDraft(reference) {
+  revokeEditReferencePreviewUrl();
   state.referenceDraft = null;
   state.referenceImage = null;
   if (!reference?.preview) {
@@ -3976,6 +4584,7 @@ async function importReferenceUrl() {
       file: new File([blob], `reference.${extension}`, { type: blob.type }),
       name: `reference.${extension}`
     };
+    revokeEditReferencePreviewUrl();
     state.referenceDraft = {
       kind: "url",
       url,
@@ -4070,6 +4679,9 @@ $("#top-generate").addEventListener("click", generateImage);
 removeFailedQueue.addEventListener("click", removeFailedQueueItems);
 removeDoneQueue.addEventListener("click", removeDoneQueueItems);
 clearQueue.addEventListener("click", clearQueueItems);
+if (retryFailedQueue) {
+  retryFailedQueue.addEventListener("click", retryFailedQueueItems);
+}
 if (queueToggle) {
   queueToggle.addEventListener("click", () => {
     queueExpanded = !queueExpanded;
@@ -4084,6 +4696,8 @@ queueList.addEventListener("click", (event) => {
   const item = action.closest(".queue-item");
   if (action.dataset.queueAction === "note") {
     editQueueItemNote(item);
+  } else if (action.dataset.queueAction === "retry") {
+    retryQueueItem(item);
   }
 });
 if (apiBaseInput) {
@@ -4208,6 +4822,7 @@ $("#reset-settings").addEventListener("click", () => {
   updateCustomStyleUi();
   state.referenceImage = null;
   state.referenceDraft = null;
+  revokeEditReferencePreviewUrl();
   referenceUpload.value = "";
   updateReferencePreview("");
   $("#creativity").value = 64;
@@ -4256,6 +4871,7 @@ referenceUpload.addEventListener("change", () => {
     file,
     name: file.name || "reference.png"
   };
+  revokeEditReferencePreviewUrl();
 
   const reader = new FileReader();
   reader.addEventListener("load", () => {
@@ -4278,6 +4894,70 @@ referenceUpload.addEventListener("change", () => {
 mainPreview.addEventListener("load", () => {
   if (mainPreview.naturalWidth && mainPreview.naturalHeight) {
     captureImageResolution(state.activeImage || mainPreview.currentSrc || mainPreview.src, mainPreview);
+  }
+  updateEditorAvailability();
+});
+
+if (openEditorButton) {
+  openEditorButton.addEventListener("click", openImageEditor);
+}
+if (editPreviewImage) {
+  editPreviewImage.addEventListener("load", resizeEditCanvas);
+}
+if (editDrawCanvas) {
+  editDrawCanvas.addEventListener("pointerdown", beginEditDraw);
+  editDrawCanvas.addEventListener("pointermove", moveEditDraw);
+  editDrawCanvas.addEventListener("pointerup", endEditDraw);
+  editDrawCanvas.addEventListener("pointercancel", endEditDraw);
+  editDrawCanvas.addEventListener("pointerleave", endEditDraw);
+}
+if (toggleBrushButton) {
+  toggleBrushButton.addEventListener("click", () => {
+    setEditBrushEnabled(!editBrushEnabled);
+  });
+}
+if (clearBrushButton) {
+  clearBrushButton.addEventListener("click", () => {
+    clearEditMarks();
+    showToast("标记已清除");
+  });
+}
+if (useAsReferenceButton) {
+  useAsReferenceButton.addEventListener("click", async () => {
+    const ok = await useCurrentImageAsReference({ includeMarks: true });
+    if (ok) {
+      const nextPrompt = editPromptInput.value.trim();
+      if (nextPrompt) {
+        promptInput.value = editHasMarks
+          ? `${nextPrompt}\n\n红色画笔标记的是需要重点修改的位置。最终成图不要保留红色标记、圈线或涂鸦。`
+          : nextPrompt;
+        scheduleWorkspaceDraftSave();
+      }
+      closeImageEditor();
+    }
+  });
+}
+if (generateEditButton) {
+  generateEditButton.addEventListener("click", generateEditFromCurrentImage);
+}
+if (closeEditorButton) {
+  closeEditorButton.addEventListener("click", closeImageEditor);
+}
+if (editModal) {
+  editModal.addEventListener("click", (event) => {
+    if (event.target.closest("[data-edit-close]")) {
+      closeImageEditor();
+    }
+  });
+}
+window.addEventListener("resize", () => {
+  if (editModal && !editModal.hidden) {
+    resizeEditCanvas();
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && editModal && !editModal.hidden) {
+    closeImageEditor();
   }
 });
 

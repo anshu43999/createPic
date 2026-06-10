@@ -568,6 +568,148 @@
       font-size: 12px;
     }
 
+    body.modal-open {
+      overflow: hidden;
+    }
+
+    .edit-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+
+    .edit-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(10, 25, 30, 0.42);
+      backdrop-filter: blur(10px);
+    }
+
+    .edit-dialog {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      width: min(1080px, calc(100vw - 32px));
+      max-height: min(820px, calc(100dvh - 32px));
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-solid);
+      box-shadow: 0 28px 80px rgba(10, 25, 30, 0.24);
+    }
+
+    .edit-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .edit-head h2 {
+      font-size: 17px;
+    }
+
+    .edit-head p {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .icon-button {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.84);
+      font-size: 20px;
+      font-weight: 800;
+    }
+
+    .edit-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 14px;
+      min-height: 0;
+      padding: 14px;
+      overflow: hidden;
+    }
+
+    .edit-preview {
+      display: grid;
+      min-width: 0;
+      min-height: 0;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background:
+        linear-gradient(45deg, rgba(10, 108, 116, .04) 25%, transparent 25% 75%, rgba(10, 108, 116, .04) 75%),
+        linear-gradient(45deg, rgba(10, 108, 116, .04) 25%, transparent 25% 75%, rgba(10, 108, 116, .04) 75%),
+        #fff;
+      background-position: 0 0, 12px 12px, 0 0;
+      background-size: 24px 24px;
+    }
+
+    .edit-image-wrap {
+      position: relative;
+      display: flex;
+      min-height: 360px;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      padding: 16px;
+    }
+
+    .edit-image-wrap img {
+      display: block;
+      max-width: 100%;
+      max-height: calc(100dvh - 210px);
+      object-fit: contain;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    #edit-draw-canvas {
+      position: absolute;
+      z-index: 2;
+      cursor: crosshair;
+      touch-action: none;
+    }
+
+    #edit-draw-canvas.is-disabled {
+      cursor: default;
+      pointer-events: none;
+    }
+
+    .edit-tools {
+      display: grid;
+      align-content: start;
+      gap: 12px;
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+    }
+
+    .brush-tools,
+    .edit-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .edit-tools textarea {
+      min-height: 180px;
+      resize: vertical;
+    }
+
     .stage-body {
       /* 历史面板也稍微加宽，平衡画布两侧的重力 */
       display: grid;
@@ -728,6 +870,10 @@
       justify-content: flex-end;
     }
 
+    .library-panel.is-collapsed .library-actions button:not(#toggle-library) {
+      display: none;
+    }
+
     /* 任务队列与作品库：超宽屏下自动多列展示 */
     .batch-list, .asset-list, .queue-list {
       display: grid;
@@ -818,6 +964,47 @@
     .queue-item-main strong {
       font-size: 14px;
       letter-spacing: 0.3px;
+    }
+
+    .queue-item-main {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .queue-item-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .queue-status {
+      min-height: 26px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(10, 108, 116, 0.06);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .queue-note-button,
+    .queue-retry-button {
+      min-height: 26px;
+      padding: 0 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .queue-retry-button {
+      color: #fff;
+      border-color: var(--accent);
+      background: var(--accent);
     }
 
     /* 原生进度条美化 */
@@ -941,6 +1128,20 @@
       .stage-header {
         align-items: stretch;
         flex-direction: column;
+      }
+      .edit-modal {
+        padding: 8px;
+      }
+      .edit-dialog {
+        width: calc(100vw - 16px);
+        max-height: calc(100dvh - 16px);
+      }
+      .edit-body {
+        grid-template-columns: 1fr;
+        overflow: auto;
+      }
+      .edit-image-wrap {
+        min-height: 260px;
       }
       .status-strip {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1321,6 +1522,7 @@
             <div class="stage-status">
               <span id="result-state-label">等待生成</span>
               <strong id="result-size-label">接口默认</strong>
+              <button class="secondary-action" type="button" id="open-editor" disabled>编辑当前图</button>
               <button class="secondary-action" type="button" id="download-current">下载当前</button>
             </div>
           </div>
@@ -1364,6 +1566,7 @@
               <span id="queue-count">0</span>
             </div>
             <div class="queue-actions">
+              <button class="ghost-button" type="button" id="retry-failed-queue">重试失败</button>
               <button class="ghost-button" type="button" id="remove-failed-queue">删失败</button>
               <button class="ghost-button" type="button" id="remove-done-queue">删完成</button>
               <button class="ghost-button" type="button" id="clear-queue">清空</button>
@@ -1373,7 +1576,7 @@
           <button class="ghost-button queue-more-button" type="button" id="toggle-queue-list" hidden>展开全部</button>
         </aside>
 
-        <aside class="panel library-panel is-collapsed">
+        <aside class="panel library-panel">
           <div class="panel-head library-head">
             <div class="library-title">
               <h2>作品库</h2>
@@ -1384,11 +1587,11 @@
               <button class="danger-action" type="button" id="delete-assets" hidden disabled>删除</button>
               <button class="danger-action" type="button" id="delete-all-assets" disabled>全部删除</button>
               <button class="ghost-button" type="button" id="finish-asset-select" hidden>完成</button>
-              <button class="ghost-button" type="button" id="toggle-library" aria-expanded="false" aria-controls="library-body">展开</button>
+              <button class="ghost-button" type="button" id="toggle-library" aria-expanded="true" aria-controls="library-body">收起</button>
             </div>
           </div>
 
-          <div class="field-group library-body" id="library-body" hidden>
+          <div class="field-group library-body" id="library-body">
             <div class="search-box">
               <input type="search" id="library-search" placeholder="搜索作品">
             </div>
@@ -1398,6 +1601,39 @@
       </div>
     </section>
   </main>
+
+  <div class="edit-modal" id="edit-modal" hidden role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+    <div class="edit-backdrop" data-edit-close></div>
+    <section class="edit-dialog">
+      <div class="edit-head">
+        <div>
+          <h2 id="edit-modal-title">图片编辑</h2>
+          <p>用画笔标出要修改的位置，红色标记只作为生成参考。</p>
+        </div>
+        <button class="icon-button" type="button" id="close-editor" aria-label="关闭编辑">×</button>
+      </div>
+      <div class="edit-body">
+        <figure class="edit-preview">
+          <div class="edit-image-wrap" id="edit-image-wrap">
+            <img src="" alt="编辑图片预览" id="edit-preview-image" draggable="false">
+            <canvas id="edit-draw-canvas" aria-label="画笔标注层"></canvas>
+          </div>
+        </figure>
+        <div class="edit-tools">
+          <div class="brush-tools" aria-label="编辑工具">
+            <button class="ghost-button active" type="button" id="toggle-brush" aria-pressed="true">画笔</button>
+            <button class="ghost-button" type="button" id="clear-brush">清除标记</button>
+          </div>
+          <label for="edit-prompt">修改提示词</label>
+          <textarea id="edit-prompt" placeholder="描述你想如何修改当前图片"></textarea>
+          <div class="edit-actions">
+            <button class="ghost-button" type="button" id="use-as-reference">设为参考图</button>
+            <button class="primary-action" type="button" id="generate-edit">生成修改版</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
 
   <script src="app.js"></script>
 </body>
