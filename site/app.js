@@ -37,6 +37,9 @@ let editBrushDrawing = false;
 let editHasMarks = false;
 let editLastPoint = null;
 let editReferencePreviewUrl = "";
+let activeGenerationJobCount = 0;
+let generationJobQueue = [];
+let retryGenerationJobCount = 0;
 const selectedAssetImages = new Set();
 const selectedQueueJobIds = new Set();
 const expandedBatchIds = new Set();
@@ -138,7 +141,7 @@ const modelSelect = $("#model");
 const styleSelect = $("#style");
 const customStyleInput = $("#custom-style");
 const generateButtons = [$("#generate"), $("#top-generate")];
-const batchConcurrencyLimit = 10;
+const batchConcurrencyLimit = 5;
 
 function normalizeApiBase(value) {
   let raw = String(value || "").trim();
@@ -975,11 +978,6 @@ async function useCurrentImageAsReference({ announce = true, includeMarks = fals
 }
 
 async function generateEditFromCurrentImage() {
-  if (isGenerationBusy()) {
-    showToast("当前正在生成，请稍后再编辑", "error");
-    return;
-  }
-
   const nextPrompt = editPromptInput.value.trim();
   if (!nextPrompt) {
     showToast("请先输入修改提示词", "error");
@@ -1056,7 +1054,6 @@ function getAccuracyRule() {
 
 function setBusy(isBusy) {
   generateButtons.forEach((button) => {
-    button.disabled = isBusy;
     button.classList.toggle("loading", isBusy);
   });
   updateQueueRetryControls();
@@ -1738,7 +1735,7 @@ function updateQueueSelectionUi() {
   if (deleteQueueButton) {
     const selectedCount = selectedQueueJobIds.size;
     deleteQueueButton.hidden = !queueSelectionMode;
-    deleteQueueButton.disabled = selectedCount === 0 || isGenerationBusy();
+    deleteQueueButton.disabled = selectedCount === 0;
     deleteQueueButton.textContent = selectedCount ? `删除 ${selectedCount}` : "删除选中";
   }
   if (finishQueueSelectButton) {
@@ -1892,7 +1889,102 @@ function finishQueueJob(item, status, failed = false) {
 }
 
 function isGenerationBusy() {
-  return generateButtons.some((button) => button.disabled);
+  return activeGenerationJobCount > 0 || generationJobQueue.length > 0 || retryGenerationJobCount > 0;
+}
+
+function updateGenerationActivityUi() {
+  const busy = isGenerationBusy();
+  setBusy(busy);
+  updateQueueRetryControls();
+}
+
+function getQueueItemRunningState(item) {
+  return String(item?.dataset.running || "") === "true";
+}
+
+function removeQueuedGenerationJobsByIds(jobIds) {
+  if (!jobIds.length) {
+    return;
+  }
+
+  const removeSet = new Set(jobIds);
+  generationJobQueue = generationJobQueue.filter((job) => !removeSet.has(job.jobId));
+}
+
+function cancelQueueItem(item, status = "已取消") {
+  if (!item) {
+    return;
+  }
+
+  const batchId = item.dataset.batchId || "";
+  const batchItemId = item.dataset.batchItemId || "";
+  const jobId = getQueueItemJobId(item);
+  if (batchId && batchItemId) {
+    updateBatchItem(batchId, batchItemId, {
+      state: "failed",
+      status
+    });
+  }
+  removeQueuedGenerationJobsByIds(jobId ? [jobId] : []);
+  item.remove();
+  if (jobId) {
+    selectedQueueJobIds.delete(jobId);
+  }
+}
+
+function cancelQueuedGenerationJobs(batchId, status = "已取消") {
+  if (!batchId) {
+    return;
+  }
+
+  const nextQueue = [];
+  generationJobQueue.forEach((job) => {
+    if (job.batchId !== batchId) {
+      nextQueue.push(job);
+      return;
+    }
+
+    if (job.batchItemId) {
+      updateBatchItem(job.batchId, job.batchItemId, {
+        state: "failed",
+        status
+      });
+    }
+    finishQueueJob(job.item, status, true);
+  });
+  generationJobQueue = nextQueue;
+}
+
+function enqueueGenerationJobs(jobs = []) {
+  if (!jobs.length) {
+    return;
+  }
+
+  generationJobQueue.push(...jobs);
+  updateGenerationActivityUi();
+  pumpGenerationQueue();
+}
+
+function pumpGenerationQueue() {
+  while (activeGenerationJobCount + retryGenerationJobCount < batchConcurrencyLimit && generationJobQueue.length) {
+    const job = generationJobQueue.shift();
+    if (!job) {
+      continue;
+    }
+
+    activeGenerationJobCount += 1;
+    updateGenerationActivityUi();
+    Promise.resolve()
+      .then(() => job.run())
+      .catch((error) => {
+        console.warn("Queued generation job failed:", error.message);
+      })
+      .finally(() => {
+        activeGenerationJobCount = Math.max(0, activeGenerationJobCount - 1);
+        updateGenerationActivityUi();
+        pumpGenerationQueue();
+      });
+  }
 }
 
 function removeQueueItems(predicate, label) {
@@ -1917,20 +2009,16 @@ function deleteSelectedQueueItems() {
     return;
   }
 
-  if (isGenerationBusy()) {
-    showToast("生成中暂时不能删除任务队列", "error");
-    return;
-  }
-
-  const runningItems = items.filter((item) => item.dataset.running === "true");
+  const runningItems = items.filter(getQueueItemRunningState);
   if (runningItems.length) {
     showToast("生成中的任务暂时不能删除", "error");
     return;
   }
 
-  items.forEach((item) => item.remove());
+  items.forEach((item) => cancelQueueItem(item));
   selectedQueueJobIds.clear();
   setQueueSelectionMode(false);
+  updateGenerationActivityUi();
   updateStatus();
   scheduleWorkspaceDraftSave();
   showToast(`已删除 ${items.length} 个任务`);
@@ -1991,28 +2079,34 @@ async function retryFailedQueueItems() {
     }
   }
 
-  setBusy(true);
-  resultStateLabel.textContent = items.length > 1 ? "重试失败任务中" : "重试任务中";
+  retryGenerationJobCount += 1;
+  updateGenerationActivityUi();
   const summary = { success: 0, failed: 0 };
-  for (const item of items) {
-    const ok = await retryQueueItem(item, { keepBusy: true, silentSummary: true });
-    if (ok) {
-      summary.success += 1;
-    } else {
-      summary.failed += 1;
+  try {
+    resultStateLabel.textContent = items.length > 1 ? "重试失败任务中" : "重试任务中";
+    for (const item of items) {
+      const ok = await retryQueueItem(item, { keepBusy: true, silentSummary: true });
+      if (ok) {
+        summary.success += 1;
+      } else {
+        summary.failed += 1;
+      }
     }
+    resultStateLabel.textContent = summary.failed
+      ? summary.success ? "部分重试完成" : "重试失败"
+      : "重试完成";
+    showToast(
+      summary.failed
+        ? `重试完成：成功 ${summary.success} 个，失败 ${summary.failed} 个`
+        : `已重试成功 ${summary.success} 个`,
+      summary.failed ? "error" : undefined
+    );
+  } finally {
+    retryGenerationJobCount = Math.max(0, retryGenerationJobCount - 1);
+    updateGenerationActivityUi();
+    pumpGenerationQueue();
+    updateStatus();
   }
-  setBusy(false);
-  resultStateLabel.textContent = summary.failed
-    ? summary.success ? "部分重试完成" : "重试失败"
-    : "重试完成";
-  showToast(
-    summary.failed
-      ? `重试完成：成功 ${summary.success} 个，失败 ${summary.failed} 个`
-      : `已重试成功 ${summary.success} 个`,
-    summary.failed ? "error" : undefined
-  );
-  updateStatus();
 }
 
 async function retryQueueItem(item, options = {}) {
@@ -2050,7 +2144,8 @@ async function retryQueueItem(item, options = {}) {
   }
 
   if (!options.keepBusy) {
-    setBusy(true);
+    retryGenerationJobCount += 1;
+    updateGenerationActivityUi();
   }
 
   const requestId = `retry-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -2127,7 +2222,9 @@ async function retryQueueItem(item, options = {}) {
     return false;
   } finally {
     if (!options.keepBusy) {
-      setBusy(false);
+      retryGenerationJobCount = Math.max(0, retryGenerationJobCount - 1);
+      updateGenerationActivityUi();
+      pumpGenerationQueue();
     }
     updateStatus();
   }
@@ -2585,9 +2682,14 @@ async function generateImage() {
   }
 
   const targets = getGenerationTargets();
+  const generationMode = state.mode;
+  const qualityLabel = state.quality;
   const batchStart = state.generatedCount;
   const requestPrompt = buildPrompt(finalPrompt);
   const requestQuality = mapQuality();
+  const referenceImage = state.referenceImage
+    ? { file: state.referenceImage.file, name: state.referenceImage.name }
+    : null;
   const batch = createGenerationBatch(finalPrompt, targets);
   const jobs = targets.map((target, index) => {
     const title = `${promptInput.value.trim().slice(0, 10) || "生成作品"} #${batchStart + index + 1}`;
@@ -2602,7 +2704,7 @@ async function generateImage() {
         batchId: batch.id,
         batchItemId: batchItem.id || "",
         requestId: batchItem.requestId || "",
-        mode: state.mode,
+        mode: generationMode,
         targetWidth: target.width,
         targetHeight: target.height,
         targetLabel: target.label,
@@ -2638,9 +2740,9 @@ async function generateImage() {
     requestHistorySyncSoon(900, { updateActive: false });
 
     try {
-      const response = state.mode === "image"
-        ? await generateImageEdit(finalPrompt, target, { batchId, batchItemId, requestId })
-        : await generateImageFromText(finalPrompt, target, { batchId, batchItemId, requestId });
+      const response = generationMode === "image"
+        ? await generateImageEdit(finalPrompt, target, { batchId, batchItemId, requestId }, { promptReady: true, quality: requestQuality, referenceImage })
+        : await generateImageFromText(finalPrompt, target, { batchId, batchItemId, requestId }, { promptReady: true, quality: requestQuality });
 
       const images = extractImages(response);
       const imageUrl = await resolveFirstLoadableImage(images);
@@ -2655,7 +2757,7 @@ async function generateImage() {
         image: imageUrl,
         title,
         resolution,
-        meta: `${state.mode === "image" ? "图生图" : "文生图"} / ${state.quality} / ${target.label}`,
+        meta: `${generationMode === "image" ? "图生图" : "文生图"} / ${qualityLabel} / ${target.label}`,
         clientBatchId: batchId,
         clientItemId: batchItemId,
         clientRequestId: requestId,
@@ -2693,6 +2795,7 @@ async function generateImage() {
       });
       if (isAuthError(error)) {
         authFailed = true;
+        cancelQueuedGenerationJobs(batchId, "已取消：Key无效");
         statusApi.textContent = "Key无效";
         statusApi.classList.remove("ok");
       }
@@ -2704,33 +2807,14 @@ async function generateImage() {
     }
   };
 
-  const [firstJob, ...remainingJobs] = jobs;
-  if (firstJob) {
-    await runGenerationJob(firstJob);
-  }
+  const queuedJobs = jobs.map((job) => ({
+    ...job,
+    run: () => runGenerationJob(job)
+  }));
 
-  if (authFailed && remainingJobs.length) {
-    for (const job of remainingJobs) {
-      await runGenerationJob(job);
-    }
-    showToast("Key 无效，已停止剩余批量任务", "error");
-  } else if (remainingJobs.length) {
-    resultStateLabel.textContent = "并发生成中";
-    await runConcurrent(remainingJobs, Math.min(batchConcurrencyLimit, remainingJobs.length), runGenerationJob);
-  }
-
-  setBusy(false);
-  resultStateLabel.textContent = summary.failed
-    ? summary.success ? "部分完成" : "生成失败"
-    : summary.deferred ? "等待后端图片"
-    : "已完成";
-  if (summary.failed) {
-    showToast(`批量完成：成功 ${summary.success} 张，失败 ${summary.failed} 张`, "error");
-  } else if (summary.deferred) {
-    showToast(`后端仍在回传 ${summary.deferred} 张，已开始同步`);
-  } else {
-    showToast(targets.length > 1 ? `并发完成 ${summary.success} 张` : "生成完成");
-  }
+  enqueueGenerationJobs(queuedJobs);
+  resultStateLabel.textContent = `已提交 ${jobs.length} 个任务`;
+  showToast(`已提交 ${jobs.length} 个任务到队列`);
   updateStatus();
 }
 
@@ -2772,6 +2856,10 @@ async function generateImageFromText(prompt, target, trace = {}, options = {}) {
 
 async function generateImageEdit(prompt, target, trace = {}, options = {}) {
   const size = resolveProviderSize(target.width, target.height);
+  const reference = options.referenceImage || state.referenceImage;
+  if (!reference?.file) {
+    throw new Error("图生图需要先选择参考图");
+  }
   const form = new FormData();
   form.append("model", getImageModel());
   form.append("prompt", options.promptReady ? prompt : buildPrompt(prompt));
@@ -2780,7 +2868,7 @@ async function generateImageEdit(prompt, target, trace = {}, options = {}) {
   }
   form.append("quality", options.quality || mapQuality());
   form.append("n", "1");
-  form.append("image", state.referenceImage.file, state.referenceImage.name);
+  form.append("image", reference.file, reference.name || "reference.png");
 
   const response = await fetch(apiUrl(apiPaths.imageEdits), {
     method: "POST",
