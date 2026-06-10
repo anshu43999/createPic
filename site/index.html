@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="same-origin">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' http: https: data: blob:; connect-src 'self' http: https:; base-uri 'self'; form-action 'self'; object-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' http: https: data: blob:; connect-src 'self' http: https: blob:; base-uri 'self'; form-action 'self'; object-src 'none'">
   <title>TokensKingdom 生图工作台</title>
   <style>
     :root {
@@ -920,6 +920,11 @@
       background: rgba(255, 255, 255, 0.75);
       backdrop-filter: blur(12px);
     }
+
+    .queue-item {
+      position: relative;
+    }
+
     .batch-card {
       padding: 16px;
     }
@@ -950,6 +955,32 @@
     .asset-item.is-selected {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(10, 108, 116, 0.15);
+    }
+
+    .queue-list.is-selecting .queue-item {
+      cursor: pointer;
+    }
+
+    .queue-item.is-selected {
+      border-color: var(--accent);
+      background: linear-gradient(180deg, rgba(10, 108, 116, 0.1), rgba(255, 255, 255, 0.82));
+      box-shadow: 0 0 0 3px rgba(10, 108, 116, 0.14);
+    }
+
+    .queue-item.is-selected::after {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      display: grid;
+      width: 22px;
+      height: 22px;
+      place-items: center;
+      color: #fff;
+      border-radius: 999px;
+      background: var(--accent);
+      font-size: 13px;
+      font-weight: 900;
+      content: "✓";
     }
 
     .asset-item img, .variant-strip img {
@@ -1289,9 +1320,8 @@
             <h3 id="prompt-label">提示词</h3>
             <span class="hint">评分 <strong id="prompt-score">--</strong></span>
           </div>
-          <textarea id="prompt" placeholder="输入或生成提示词"></textarea>
+          <textarea id="prompt" placeholder="输入提示词"></textarea>
           <div class="prompt-tools">
-            <button class="ghost-button" type="button" id="compose-prompt">生成提示词</button>
             <button class="ghost-button" type="button" id="copy-prompt">复制</button>
             <button class="ghost-button" type="button" id="clear-prompt">清空</button>
           </div>
@@ -1566,6 +1596,9 @@
               <span id="queue-count">0</span>
             </div>
             <div class="queue-actions">
+              <button class="ghost-button" type="button" id="select-queue">选择</button>
+              <button class="danger-action" type="button" id="delete-queue" hidden disabled>删除选中</button>
+              <button class="ghost-button" type="button" id="finish-queue-select" hidden>完成</button>
               <button class="ghost-button" type="button" id="retry-failed-queue">重试失败</button>
               <button class="ghost-button" type="button" id="remove-failed-queue">删失败</button>
               <button class="ghost-button" type="button" id="remove-done-queue">删完成</button>

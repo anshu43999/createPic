@@ -29,6 +29,7 @@ let historySyncTimer = 0;
 let historySyncInFlight = false;
 let historySyncPromise = null;
 let librarySelectionMode = false;
+let queueSelectionMode = false;
 let queueExpanded = false;
 let activePreviewGroup = { batchId: "", index: 0, items: [] };
 let editBrushEnabled = true;
@@ -37,6 +38,7 @@ let editHasMarks = false;
 let editLastPoint = null;
 let editReferencePreviewUrl = "";
 const selectedAssetImages = new Set();
+const selectedQueueJobIds = new Set();
 const expandedBatchIds = new Set();
 
 const apiPaths = {
@@ -62,6 +64,9 @@ const statusApi = $("#status-api");
 const statusQueue = $("#status-queue");
 const queueCount = $("#queue-count");
 const queueList = $("#queue-list");
+const selectQueueButton = $("#select-queue");
+const deleteQueueButton = $("#delete-queue");
+const finishQueueSelectButton = $("#finish-queue-select");
 const removeFailedQueue = $("#remove-failed-queue");
 const removeDoneQueue = $("#remove-done-queue");
 const clearQueue = $("#clear-queue");
@@ -554,6 +559,7 @@ function updateStatus() {
     queueToggle.textContent = queueExpanded ? "收起队列" : `展开全部 ${queueList.children.length}`;
   }
   updateQueueRetryControls();
+  updateQueueSelectionUi();
   $("#asset-list").classList.toggle("empty", $("#asset-list").children.length === 0);
   updateLibrarySelectionUi();
   if (variantStrip) {
@@ -935,15 +941,19 @@ async function useCurrentImageAsReference({ announce = true, includeMarks = fals
       name
     };
 
+    const previousRef = state.referenceDraft?.imageRef;
+    const persisted = await persistImageSourceForDraft(blob, "reference");
+    deletePersistedImageRef(previousRef).catch(() => {});
     revokeEditReferencePreviewUrl();
-    const preview = marked ? URL.createObjectURL(blob) : safeImage;
-    if (marked) {
+    const preview = persisted.image || (marked ? URL.createObjectURL(blob) : safeImage);
+    if (preview.startsWith("blob:")) {
       editReferencePreviewUrl = preview;
     }
     state.referenceDraft = {
       kind: marked || preview.startsWith("blob:") ? "object" : preview.startsWith("data:image/") ? "data" : "url",
-      url: marked ? "" : safeImage,
+      url: "",
       preview,
+      imageRef: persisted.imageRef,
       name,
       type: blob.type
     };
@@ -953,7 +963,7 @@ async function useCurrentImageAsReference({ announce = true, includeMarks = fals
     activateByDataset("[data-mode]", "mode", "image");
     updateModeUi();
     updateStatus();
-    scheduleWorkspaceDraftSave();
+    flushWorkspaceDraftSave();
     if (announce) {
       showToast(marked ? "已把标注图设为参考图" : "已把当前图设为参考图");
     }
@@ -1001,7 +1011,7 @@ function updateBoardUi(name = getActiveBoard()) {
   }
   promptInput.placeholder = isFreePrompt
     ? "直接输入完整生图需求。这里不会自动套模板、平台规则或推荐玩法。"
-    : "输入或生成提示词";
+    : "输入提示词";
   templateSectionTitle.textContent = preset.templateTitle;
   playSectionLabel.textContent = preset.playLabel;
   platformLabel.textContent = preset.platformLabel;
@@ -1249,6 +1259,140 @@ function canPersistImageSource(value) {
     return false;
   }
   return !raw.startsWith("data:image/") || raw.length <= maxSavedReferenceLength;
+}
+
+const imageCacheDbName = "tk-image-workbench-image-cache";
+const imageCacheStoreName = "images";
+let imageCacheDbPromise = null;
+
+function idbRequestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+}
+
+function openImageCacheDb() {
+  if (!window.indexedDB) {
+    return Promise.resolve(null);
+  }
+
+  if (!imageCacheDbPromise) {
+    imageCacheDbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(imageCacheDbName, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(imageCacheStoreName)) {
+          db.createObjectStore(imageCacheStoreName, { keyPath: "key" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+    });
+  }
+
+  return imageCacheDbPromise;
+}
+
+async function persistImageSourceForDraft(source, keyPrefix = "asset") {
+  const safe = source instanceof Blob ? "" : sanitizeImageSource(source);
+  if (!(source instanceof Blob) && !safe) {
+    return { image: "", imageRef: null };
+  }
+
+  let blob;
+  if (source instanceof Blob) {
+    blob = source;
+  } else if (safe.startsWith("data:image/")) {
+    blob = dataUrlToFile(safe, "image.png");
+  } else {
+    blob = await fetchImageBlob(safe);
+  }
+
+  if (!blob?.type?.startsWith("image/")) {
+    return { image: safe, imageRef: null };
+  }
+
+  const db = await openImageCacheDb();
+  if (!db) {
+    return { image: safe, imageRef: null };
+  }
+
+  const key = `${keyPrefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const tx = db.transaction(imageCacheStoreName, "readwrite");
+  await idbRequestToPromise(tx.objectStore(imageCacheStoreName).put({
+    key,
+    blob,
+    type: blob.type,
+    savedAt: Date.now()
+  }));
+
+  return {
+    image: URL.createObjectURL(blob),
+    imageRef: {
+      kind: "idb",
+      key,
+      type: blob.type
+    }
+  };
+}
+
+function normalizeImageRef(imageRef) {
+  if (!imageRef || imageRef.kind !== "idb" || !imageRef.key) {
+    return null;
+  }
+
+  return {
+    kind: "idb",
+    key: String(imageRef.key),
+    type: String(imageRef.type || "image/png")
+  };
+}
+
+async function restorePersistedImageSource(imageRef) {
+  const normalized = normalizeImageRef(imageRef);
+  if (!normalized) {
+    return "";
+  }
+
+  const db = await openImageCacheDb();
+  if (!db) {
+    return "";
+  }
+
+  const tx = db.transaction(imageCacheStoreName, "readonly");
+  const entry = await idbRequestToPromise(tx.objectStore(imageCacheStoreName).get(normalized.key));
+  return entry?.blob ? URL.createObjectURL(entry.blob) : "";
+}
+
+async function deletePersistedImageRef(imageRef) {
+  const normalized = normalizeImageRef(imageRef);
+  if (!normalized) {
+    return;
+  }
+
+  const db = await openImageCacheDb();
+  if (!db) {
+    return;
+  }
+
+  const tx = db.transaction(imageCacheStoreName, "readwrite");
+  await idbRequestToPromise(tx.objectStore(imageCacheStoreName).delete(normalized.key));
+}
+
+function deletePersistedImageRefs(imageRefs = []) {
+  const seen = new Set();
+  imageRefs.forEach((imageRef) => {
+    const normalized = normalizeImageRef(imageRef);
+    if (!normalized || seen.has(normalized.key)) {
+      return;
+    }
+
+    seen.add(normalized.key);
+    deletePersistedImageRef(normalized).catch((error) => {
+      console.warn("Delete image cache failed:", error.message);
+    });
+  });
 }
 
 function getActiveAsset() {
@@ -1551,6 +1695,95 @@ function updateQueueRetryControls() {
   $$(".queue-item").forEach(updateQueueRetryUi);
 }
 
+function getQueueItemJobId(item) {
+  return String(item?.dataset.jobId || "");
+}
+
+function syncQueueSelectionItem(item) {
+  if (!item) {
+    return;
+  }
+  const selected = selectedQueueJobIds.has(getQueueItemJobId(item));
+  item.classList.toggle("is-selected", selected);
+  item.setAttribute("aria-pressed", selected ? "true" : "false");
+}
+
+function updateQueueSelectionUi() {
+  const items = $$(".queue-item");
+  const visibleKeys = new Set();
+  items.forEach((item) => {
+    const key = getQueueItemJobId(item);
+    if (!key) {
+      return;
+    }
+    visibleKeys.add(key);
+    if (queueSelectionMode) {
+      syncQueueSelectionItem(item);
+    } else {
+      item.classList.remove("is-selected");
+      item.removeAttribute("aria-pressed");
+    }
+  });
+
+  Array.from(selectedQueueJobIds).forEach((key) => {
+    if (!visibleKeys.has(key)) {
+      selectedQueueJobIds.delete(key);
+    }
+  });
+
+  if (selectQueueButton) {
+    selectQueueButton.hidden = queueSelectionMode;
+    selectQueueButton.disabled = items.length === 0;
+  }
+  if (deleteQueueButton) {
+    const selectedCount = selectedQueueJobIds.size;
+    deleteQueueButton.hidden = !queueSelectionMode;
+    deleteQueueButton.disabled = selectedCount === 0 || isGenerationBusy();
+    deleteQueueButton.textContent = selectedCount ? `删除 ${selectedCount}` : "删除选中";
+  }
+  if (finishQueueSelectButton) {
+    finishQueueSelectButton.hidden = !queueSelectionMode;
+  }
+  if (removeFailedQueue) {
+    removeFailedQueue.hidden = queueSelectionMode;
+  }
+  if (removeDoneQueue) {
+    removeDoneQueue.hidden = queueSelectionMode;
+  }
+  if (clearQueue) {
+    clearQueue.hidden = queueSelectionMode;
+  }
+  if (retryFailedQueue) {
+    retryFailedQueue.hidden = queueSelectionMode;
+  }
+  if (!queueSelectionMode && selectedQueueJobIds.size) {
+    selectedQueueJobIds.clear();
+  }
+}
+
+function setQueueSelectionMode(enabled) {
+  queueSelectionMode = Boolean(enabled);
+  if (!queueSelectionMode) {
+    selectedQueueJobIds.clear();
+  }
+  queueList.classList.toggle("is-selecting", queueSelectionMode);
+  updateQueueSelectionUi();
+}
+
+function toggleQueueSelection(item) {
+  const key = getQueueItemJobId(item);
+  if (!key) {
+    return;
+  }
+  if (selectedQueueJobIds.has(key)) {
+    selectedQueueJobIds.delete(key);
+  } else {
+    selectedQueueJobIds.add(key);
+  }
+  syncQueueSelectionItem(item);
+  updateQueueSelectionUi();
+}
+
 function createQueueItem({
   title,
   status = "请求中",
@@ -1572,6 +1805,7 @@ function createQueueItem({
 }) {
   const item = document.createElement("div");
   item.className = "queue-item";
+  item.tabIndex = 0;
   item.classList.toggle("failed", Boolean(failed));
   item.classList.toggle("done", Boolean(done));
   item.dataset.jobId = jobId || `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1583,6 +1817,7 @@ function createQueueItem({
   item.dataset.createdAt = String(createdAt || Date.now());
   item.dataset.note = String(note || "").slice(0, 120);
   item.dataset.mode = mode === "image" ? "image" : "text";
+  item.dataset.running = "false";
   item.dataset.targetWidth = String(Number(targetWidth) || 0);
   item.dataset.targetHeight = String(Number(targetHeight) || 0);
   item.dataset.targetLabel = String(targetLabel || "").slice(0, 80);
@@ -1602,6 +1837,7 @@ function createQueueItem({
   `;
   item.querySelector("progress").value = Number(progress) || 0;
   updateQueueRetryUi(item);
+  syncQueueSelectionItem(item);
   return item;
 }
 
@@ -1630,6 +1866,7 @@ function updateQueueJobStatus(item, status, progress = null) {
   item.dataset.status = status;
   item.dataset.failed = "false";
   item.dataset.done = "false";
+  item.dataset.running = "true";
   updateQueueRetryUi(item);
   scheduleWorkspaceDraftSave();
 }
@@ -1649,8 +1886,9 @@ function finishQueueJob(item, status, failed = false) {
   item.dataset.status = status;
   item.dataset.failed = failed ? "true" : "false";
   item.dataset.done = failed ? "false" : "true";
+  item.dataset.running = "false";
   updateQueueRetryUi(item);
-  scheduleWorkspaceDraftSave();
+  flushWorkspaceDraftSave();
 }
 
 function isGenerationBusy() {
@@ -1664,10 +1902,38 @@ function removeQueueItems(predicate, label) {
     return;
   }
 
+  const removedKeys = items.map((item) => getQueueItemJobId(item)).filter(Boolean);
   items.forEach((item) => item.remove());
+  removedKeys.forEach((key) => selectedQueueJobIds.delete(key));
   updateStatus();
   scheduleWorkspaceDraftSave();
   showToast(`已删除${label}任务 ${items.length} 个`);
+}
+
+function deleteSelectedQueueItems() {
+  const items = $$(".queue-item").filter((item) => selectedQueueJobIds.has(getQueueItemJobId(item)));
+  if (!items.length) {
+    showToast("请选择要删除的任务");
+    return;
+  }
+
+  if (isGenerationBusy()) {
+    showToast("生成中暂时不能删除任务队列", "error");
+    return;
+  }
+
+  const runningItems = items.filter((item) => item.dataset.running === "true");
+  if (runningItems.length) {
+    showToast("生成中的任务暂时不能删除", "error");
+    return;
+  }
+
+  items.forEach((item) => item.remove());
+  selectedQueueJobIds.clear();
+  setQueueSelectionMode(false);
+  updateStatus();
+  scheduleWorkspaceDraftSave();
+  showToast(`已删除 ${items.length} 个任务`);
 }
 
 function removeFailedQueueItems() {
@@ -1692,6 +1958,8 @@ function clearQueueItems() {
 
   queueExpanded = false;
   queueList.replaceChildren();
+  selectedQueueJobIds.clear();
+  setQueueSelectionMode(false);
   updateStatus();
   scheduleWorkspaceDraftSave();
   showToast(`已清空队列 ${count} 个`);
@@ -1816,7 +2084,7 @@ async function retryQueueItem(item, options = {}) {
 
     state.generatedCount += 1;
     const resolution = formatResolution(context.target.width, context.target.height) || "接口默认";
-    const asset = addGeneratedAsset({
+    const asset = await addGeneratedAsset({
       image: imageUrl,
       title: context.title,
       resolution,
@@ -1831,7 +2099,8 @@ async function retryQueueItem(item, options = {}) {
     updateBatchItem(context.batchId, context.batchItemId, {
       state: "done",
       status: "重试完成",
-      image: imageUrl,
+      image: asset?.image || imageUrl,
+      imageRef: normalizeImageRef(asset?.imageRef),
       title: context.title,
       resolution
     });
@@ -1966,7 +2235,11 @@ function updateBatchItem(batchId, itemId, updates = {}) {
     updatePreviewGroupControls();
   }
   renderBatchHistory();
-  scheduleWorkspaceDraftSave();
+  if (updates.state === "done" || updates.state === "failed") {
+    flushWorkspaceDraftSave();
+  } else {
+    scheduleWorkspaceDraftSave();
+  }
 }
 
 function refreshBatchSummary(batch) {
@@ -2227,6 +2500,7 @@ function normalizeBatchDraft(record = {}) {
       status: String(item.status || "等待"),
       state: ["queued", "running", "done", "failed"].includes(item.state) ? item.state : "queued",
       image: sanitizeImageSource(item.image) || "",
+      imageRef: normalizeImageRef(item.imageRef),
       title: String(item.title || "").slice(0, 120),
       resolution: String(item.resolution || "").slice(0, 40),
       targetWidth: Number(item.targetWidth) || 0,
@@ -2236,6 +2510,51 @@ function normalizeBatchDraft(record = {}) {
   };
   refreshBatchSummary(batch);
   return batch;
+}
+
+async function hydrateBatchDraftItem(record = {}, batchId = "", itemIndex = 0) {
+  let image = sanitizeImageSource(record.image);
+  let imageRef = normalizeImageRef(record.imageRef);
+
+  if (!image && imageRef) {
+    try {
+      image = await restorePersistedImageSource(imageRef);
+    } catch (error) {
+      console.warn("Restore batch image cache failed:", error.message);
+    }
+  }
+
+  if (image && !imageRef) {
+    try {
+      const persisted = await persistImageSourceForDraft(image, `${batchId || "batch"}-${itemIndex}`);
+      image = persisted.image || image;
+      imageRef = persisted.imageRef;
+    } catch (error) {
+      console.warn("Persist legacy batch image failed:", error.message);
+    }
+  }
+
+  return {
+    ...record,
+    image,
+    imageRef: normalizeImageRef(imageRef)
+  };
+}
+
+async function hydrateBatchDrafts(records = []) {
+  const hydrated = [];
+  for (const [batchIndex, record] of records.entries()) {
+    const batch = normalizeBatchDraft(record);
+    const rawItems = Array.isArray(record.items) ? record.items : [];
+    batch.items = [];
+    for (const [itemIndex, item] of rawItems.slice(0, 10).entries()) {
+      const normalizedItem = normalizeBatchDraft({ ...record, id: batch.id || `batch-${batchIndex}`, items: [item] }).items[0];
+      batch.items.push(await hydrateBatchDraftItem(normalizedItem, batch.id, itemIndex));
+    }
+    refreshBatchSummary(batch);
+    hydrated.push(batch);
+  }
+  return hydrated;
 }
 
 async function generateImage() {
@@ -2332,7 +2651,7 @@ async function generateImage() {
       state.generatedCount += 1;
       summary.success += 1;
       const resolution = formatResolution(target.width, target.height) || "接口默认";
-      const asset = addGeneratedAsset({
+      const asset = await addGeneratedAsset({
         image: imageUrl,
         title,
         resolution,
@@ -2347,7 +2666,8 @@ async function generateImage() {
       updateBatchItem(batchId, batchItemId, {
         state: "done",
         status: "已完成",
-        image: imageUrl,
+        image: asset?.image || imageUrl,
+        imageRef: normalizeImageRef(asset?.imageRef),
         title,
         resolution
       });
@@ -2911,6 +3231,7 @@ function mergeAssetRecord(existing, record, options = {}) {
   if (!existing.createdAtMs && incoming.createdAtMs) existing.createdAtMs = incoming.createdAtMs;
   if (!existing.targetWidth && incoming.targetWidth) existing.targetWidth = incoming.targetWidth;
   if (!existing.targetHeight && incoming.targetHeight) existing.targetHeight = incoming.targetHeight;
+  if (!existing.imageRef && incoming.imageRef) existing.imageRef = incoming.imageRef;
   return true;
 }
 
@@ -3048,16 +3369,27 @@ function looksLikeBase64(value) {
   return value.length > 100 && /^[A-Za-z0-9+/=\s]+$/.test(value);
 }
 
-function addGeneratedAsset({ image, title, resolution, meta, clientBatchId = "", clientItemId = "", clientRequestId = "", targetWidth = 0, targetHeight = 0 }) {
+async function addGeneratedAsset({ image, title, resolution, meta, clientBatchId = "", clientItemId = "", clientRequestId = "", targetWidth = 0, targetHeight = 0 }) {
   const safeImage = sanitizeImageSource(image);
   if (!safeImage) {
     showToast("接口返回的图片地址不安全，已忽略", "error");
     return;
   }
 
+  let displayImage = safeImage;
+  let imageRef = null;
+  try {
+    const persisted = await persistImageSourceForDraft(safeImage, clientRequestId || clientItemId || "asset");
+    displayImage = persisted.image || safeImage;
+    imageRef = persisted.imageRef;
+  } catch (error) {
+    console.warn("Persist image cache failed:", error.message);
+  }
+
   const dimensions = parseResolutionDimensions(resolution);
   const { asset } = upsertAssetRecord({
-    image: safeImage,
+    image: displayImage,
+    imageRef,
     title,
     resolution,
     meta,
@@ -3073,7 +3405,7 @@ function addGeneratedAsset({ image, title, resolution, meta, clientBatchId = "",
     return null;
   }
   renderAssetItem(asset, "prepend");
-  scheduleWorkspaceDraftSave();
+  flushWorkspaceDraftSave();
   return asset;
 }
 
@@ -3637,6 +3969,17 @@ function removeAssetsByImages(images) {
 
   const removedActive = removeSet.has(getAssetImageKey(state.activeImage));
   const hadPreviewGroup = Boolean(activePreviewGroup.batchId);
+  const removedAssets = state.assets.filter((asset) => removeSet.has(getAssetImageKey(asset.image)));
+  const removedBatchImageRefs = state.batches.flatMap((batch) => {
+    const items = Array.isArray(batch.items) ? batch.items : [];
+    return items
+      .filter((item) => removeSet.has(getAssetImageKey(item.image)))
+      .map((item) => item.imageRef);
+  });
+  deletePersistedImageRefs([
+    ...removedAssets.map((asset) => asset.imageRef),
+    ...removedBatchImageRefs
+  ]);
   state.assets = state.assets.filter((asset) => !removeSet.has(getAssetImageKey(asset.image)));
   $$(".asset-item").forEach((item) => {
     if (removeSet.has(getAssetImageKey(item.dataset.image))) {
@@ -3909,6 +4252,16 @@ function scheduleWorkspaceDraftSave() {
   draftSaveTimer = window.setTimeout(saveWorkspaceDraft, 260);
 }
 
+function flushWorkspaceDraftSave() {
+  if (!draftReady) {
+    return;
+  }
+
+  window.clearTimeout(draftSaveTimer);
+  draftSaveTimer = 0;
+  saveWorkspaceDraft();
+}
+
 function saveWorkspaceDraft() {
   if (!draftReady) {
     return;
@@ -3927,11 +4280,13 @@ function saveWorkspaceDraft() {
 }
 
 function buildWorkspaceDraft() {
+  const activeAsset = getActiveAsset();
   const assets = dedupeAssetRecords(state.assets)
-    .filter((asset) => sanitizeImageSource(asset.image) && canPersistImageSource(asset.image))
+    .filter((asset) => sanitizeImageSource(asset.image) && asset.imageRef?.key)
     .slice(0, maxSavedAssets)
     .map((asset) => ({
-      image: sanitizeImageSource(asset.image),
+      image: "",
+      imageRef: normalizeImageRef(asset.imageRef),
       title: asset.title || "生成作品",
       resolution: getAssetResolution(asset),
       meta: asset.meta || "",
@@ -3953,7 +4308,8 @@ function buildWorkspaceDraft() {
     version: 7,
     savedAt: Date.now(),
     generatedCount: state.generatedCount,
-    activeImage: canPersistImageSource(state.activeImage) ? sanitizeImageSource(state.activeImage) : "",
+    activeImage: "",
+    activeImageRef: normalizeImageRef(activeAsset?.imageRef),
     reference: getPersistableReferenceDraft(),
     queue: getPersistableQueueDraft(),
     batches: getPersistableBatchDraft(),
@@ -4040,7 +4396,8 @@ function getPersistableBatchDraft() {
         label: item.label || "",
         status: item.status || "",
         state: item.state || "queued",
-        image: sanitizeImageSource(item.image) || "",
+        image: "",
+        imageRef: normalizeImageRef(item.imageRef),
         title: String(item.title || "").slice(0, 120),
         resolution: String(item.resolution || "").slice(0, 40),
         targetWidth: Number(item.targetWidth) || 0,
@@ -4050,7 +4407,7 @@ function getPersistableBatchDraft() {
     }));
 }
 
-function restoreWorkspaceDraft() {
+async function restoreWorkspaceDraft() {
   const raw = localStorage.getItem(storageKeys.draft);
   if (!raw) {
     return false;
@@ -4135,14 +4492,18 @@ function restoreWorkspaceDraft() {
     });
   }
 
-  restoreReferenceDraft(draft.reference);
+  await restoreReferenceDraft(draft.reference);
   restoreQueue(draft.queue || []);
   state.batches = Array.isArray(draft.batches)
-    ? draft.batches.slice(0, maxSavedBatches).map(normalizeBatchDraft)
+    ? await hydrateBatchDrafts(draft.batches.slice(0, maxSavedBatches).map(normalizeBatchDraft))
     : [];
   renderBatchHistory();
   const canRestoreSavedAssets = draftVersion >= 4;
-  restoreAssets(canRestoreSavedAssets ? draft.assets || [] : [], canRestoreSavedAssets ? draft.activeImage : "");
+  await restoreAssets(
+    canRestoreSavedAssets ? draft.assets || [] : [],
+    canRestoreSavedAssets ? draft.activeImage : "",
+    canRestoreSavedAssets ? draft.activeImageRef : null
+  );
   updateModeUi();
   updatePlatformPreset();
   renderWorkflowFeedback();
@@ -4173,30 +4534,40 @@ function getPersistableReferenceDraft() {
     return null;
   }
 
-  const preview = sanitizeImageSource(state.referenceDraft.preview);
-  if (!preview || !canPersistImageSource(preview)) {
+  const imageRef = normalizeImageRef(state.referenceDraft.imageRef);
+  if (!imageRef) {
     return null;
   }
 
   return {
     kind: state.referenceDraft.kind,
-    url: state.referenceDraft.url || "",
-    preview,
+    url: "",
+    preview: "",
+    imageRef,
     name: state.referenceDraft.name || "reference.png",
     type: state.referenceDraft.type || "image/png"
   };
 }
 
-function restoreReferenceDraft(reference) {
+async function restoreReferenceDraft(reference) {
   revokeEditReferencePreviewUrl();
   state.referenceDraft = null;
   state.referenceImage = null;
-  if (!reference?.preview) {
+  if (!reference?.preview && !reference?.imageRef) {
     updateReferencePreview("");
     return;
   }
 
-  const preview = sanitizeImageSource(reference.preview);
+  let preview = sanitizeImageSource(reference.preview);
+  const imageRef = normalizeImageRef(reference.imageRef);
+  if (!preview && imageRef) {
+    try {
+      preview = await restorePersistedImageSource(imageRef);
+    } catch (error) {
+      console.warn("Restore reference image cache failed:", error.message);
+    }
+  }
+
   if (!preview) {
     updateReferencePreview("");
     return;
@@ -4204,8 +4575,9 @@ function restoreReferenceDraft(reference) {
 
   state.referenceDraft = {
     kind: reference.kind || "url",
-    url: reference.url || preview,
+    url: reference.url || "",
     preview,
+    imageRef,
     name: reference.name || "reference.png",
     type: reference.type || "image/png"
   };
@@ -4214,7 +4586,7 @@ function restoreReferenceDraft(reference) {
   if (state.referenceDraft.kind === "data") {
     restoreReferenceFileFromData(state.referenceDraft);
   } else if (state.mode === "image") {
-    restoreReferenceFileFromUrl(state.referenceDraft).catch(() => {});
+    await restoreReferenceFileFromUrl(state.referenceDraft);
   }
 }
 
@@ -4240,13 +4612,54 @@ function hydrateAssetTraceFromBatches(record = {}) {
   return asset;
 }
 
-function restoreAssets(assets = [], activeImage = "") {
+async function hydrateAssetDraftRecord(record = {}) {
+  let image = sanitizeImageSource(record.image);
+  let imageRef = normalizeImageRef(record.imageRef);
+
+  if (!image && imageRef) {
+    try {
+      image = await restorePersistedImageSource(imageRef);
+    } catch (error) {
+      console.warn("Restore image cache failed:", error.message);
+    }
+  }
+
+  if (image && !imageRef) {
+    try {
+      const persisted = await persistImageSourceForDraft(image, record.clientRequestId || record.clientItemId || "asset");
+      image = persisted.image || image;
+      imageRef = persisted.imageRef;
+    } catch (error) {
+      console.warn("Persist legacy image failed:", error.message);
+    }
+  }
+
+  const asset = normalizeAssetRecord({
+    ...record,
+    image,
+    imageRef
+  });
+  if (!asset) {
+    return null;
+  }
+
+  asset.imageRef = normalizeImageRef(imageRef);
+  return asset;
+}
+
+async function restoreAssets(assets = [], activeImage = "", activeImageRef = null) {
   const assetList = $("#asset-list");
   assetList.replaceChildren();
   if (variantStrip) {
     variantStrip.replaceChildren();
   }
-  state.assets = dedupeAssetRecords(assets.map(hydrateAssetTraceFromBatches))
+
+  const hydratedAssets = await Promise.all(
+    assets
+      .slice(0, maxSavedAssets)
+      .map((asset) => hydrateAssetDraftRecord(asset))
+  );
+  state.assets = dedupeAssetRecords(hydratedAssets.filter(Boolean).map(hydrateAssetTraceFromBatches))
     .filter((asset) => sanitizeImageSource(asset.image))
     .slice(0, maxSavedAssets);
 
@@ -4254,7 +4667,10 @@ function restoreAssets(assets = [], activeImage = "") {
     renderAssetItem(asset, "append");
   });
 
-  const selected = findAssetByImage(activeImage) || state.assets[0];
+  const normalizedActiveRef = normalizeImageRef(activeImageRef);
+  const selected = findAssetByImage(activeImage)
+    || (normalizedActiveRef ? state.assets.find((asset) => normalizeImageRef(asset.imageRef)?.key === normalizedActiveRef.key) : null)
+    || state.assets[0];
   if (selected) {
     selectImageFromData(selected);
   }
@@ -4267,6 +4683,15 @@ async function ensureReferenceImageReady() {
 
   if (!state.referenceDraft) {
     return false;
+  }
+
+  if (!state.referenceDraft.preview && state.referenceDraft.imageRef) {
+    try {
+      state.referenceDraft.preview = await restorePersistedImageSource(state.referenceDraft.imageRef);
+      updateReferencePreview(state.referenceDraft.preview);
+    } catch (error) {
+      console.warn("Restore reference image cache failed:", error.message);
+    }
   }
 
   if (state.referenceDraft.kind === "data") {
@@ -4429,7 +4854,6 @@ function applyTemplate(name) {
   scenePose.value = preset.scene;
   copyDirection.value = preset.copy;
   setSelectByText($("#style"), preset.style);
-  promptInput.value = composePrompt(preset.prompt);
 }
 
 function applyBoard(name, { resetPrompt = true } = {}) {
@@ -4500,13 +4924,8 @@ function applyBoard(name, { resetPrompt = true } = {}) {
   }
 
   setToolActive("");
-  const seed = defaults.play
-    ? playPresets[defaults.play]?.prompt
-    : defaults.template
-      ? templatePresets[defaults.template]?.prompt
-      : preset.prompt;
   if (resetPrompt) {
-    promptInput.value = composePrompt(seed || preset.prompt);
+    promptInput.value = "";
   }
   updatePlatformPreset();
   renderWorkflowFeedback();
@@ -4520,37 +4939,10 @@ function applyPlay(name) {
   setSelectByText($("#style"), preset.style);
   scenePose.value = preset.scene;
   copyDirection.value = preset.copy;
-  promptInput.value = composePrompt(preset.prompt);
 }
 
 function applySceneTemplate(name) {
   scenePose.value = scenePresets[name] || scenePresets.white;
-}
-
-function composePrompt(seed = "") {
-  const platform = platformPresets[platformSelect.value] || platformPresets.amazon;
-  const activeTool = $("[data-tool].active")?.dataset.tool || "图片";
-  const consistency = getConsistencyInstruction();
-  const accuracyRule = getAccuracyRule();
-  const base = seed || `生成一张${activeTool}，突出商品本体与核心卖点。`;
-  const subjectLabel = getFieldLabel(productNameLabel, "主体");
-  const sellingLabel = getFieldLabel(productSellingPointsLabel, "方向");
-  const sceneLabel = getFieldLabel(scenePoseLabel, "场景");
-  const copyLabel = getFieldLabel(copyDirectionLabel, "用途");
-  const parts = [
-    base,
-    productName.value.trim() ? `${subjectLabel}: ${productName.value.trim()}` : "",
-    productSellingPoints.value.trim() ? `${sellingLabel}: ${productSellingPoints.value.trim()}` : "",
-    consistency,
-    `${getFieldLabel(platformLabel, "平台")}: ${platform.title}`,
-    `视觉风格: ${getStyleDirection()}`,
-    hasSizeOverride() ? `目标尺寸: ${getTargetResolutionLabel()}` : "",
-    scenePose.value.trim() ? `${sceneLabel}: ${scenePose.value.trim()}` : "",
-    copyDirection.value.trim() ? `${copyLabel}: ${copyDirection.value.trim()}` : "",
-    `平台规则: ${platform.rules}`,
-    accuracyRule
-  ].filter(Boolean);
-  return parts.join("\n");
 }
 
 function setSelectByText(select, text) {
@@ -4584,16 +4976,20 @@ async function importReferenceUrl() {
       file: new File([blob], `reference.${extension}`, { type: blob.type }),
       name: `reference.${extension}`
     };
+    const previousRef = state.referenceDraft?.imageRef;
+    const persisted = await persistImageSourceForDraft(blob, "reference");
+    deletePersistedImageRef(previousRef).catch(() => {});
     revokeEditReferencePreviewUrl();
     state.referenceDraft = {
       kind: "url",
-      url,
-      preview: url,
+      url: "",
+      preview: persisted.image || "",
+      imageRef: persisted.imageRef,
       name: `reference.${extension}`,
       type: blob.type
     };
-    updateReferencePreview(url);
-    scheduleWorkspaceDraftSave();
+    updateReferencePreview(state.referenceDraft.preview);
+    flushWorkspaceDraftSave();
     showToast("参考图已导入");
   } catch (error) {
     showToast(error.message, "error");
@@ -4666,16 +5062,17 @@ platformSelect.addEventListener("change", () => {
 claritySelect.addEventListener("change", () => {
   applyRatioSize();
 });
-$("#compose-prompt").addEventListener("click", () => {
-  if (isFreePromptBoard()) {
-    showToast("纯提示词模式不会自动生成提示词");
-    return;
-  }
-  promptInput.value = composePrompt();
-  showToast("提示词已生成");
-});
 $("#generate").addEventListener("click", generateImage);
 $("#top-generate").addEventListener("click", generateImage);
+if (selectQueueButton) {
+  selectQueueButton.addEventListener("click", () => setQueueSelectionMode(true));
+}
+if (deleteQueueButton) {
+  deleteQueueButton.addEventListener("click", deleteSelectedQueueItems);
+}
+if (finishQueueSelectButton) {
+  finishQueueSelectButton.addEventListener("click", () => setQueueSelectionMode(false));
+}
 removeFailedQueue.addEventListener("click", removeFailedQueueItems);
 removeDoneQueue.addEventListener("click", removeDoneQueueItems);
 clearQueue.addEventListener("click", clearQueueItems);
@@ -4690,15 +5087,33 @@ if (queueToggle) {
 }
 queueList.addEventListener("click", (event) => {
   const action = event.target.closest("[data-queue-action]");
+  const item = event.target.closest(".queue-item");
+  if (queueSelectionMode) {
+    if (!item || action) {
+      return;
+    }
+    toggleQueueSelection(item);
+    return;
+  }
   if (!action) {
     return;
   }
-  const item = action.closest(".queue-item");
   if (action.dataset.queueAction === "note") {
     editQueueItemNote(item);
   } else if (action.dataset.queueAction === "retry") {
     retryQueueItem(item);
   }
+});
+queueList.addEventListener("keydown", (event) => {
+  if (!queueSelectionMode || !["Enter", " "].includes(event.key)) {
+    return;
+  }
+  const item = event.target.closest(".queue-item");
+  if (!item || event.target.closest("[data-queue-action]")) {
+    return;
+  }
+  event.preventDefault();
+  toggleQueueSelection(item);
 });
 if (apiBaseInput) {
   apiBaseInput.addEventListener("change", checkApi);
@@ -4820,6 +5235,7 @@ $("#reset-settings").addEventListener("click", () => {
   styleSelect.value = "干净白底";
   customStyleInput.value = "";
   updateCustomStyleUi();
+  deletePersistedImageRef(state.referenceDraft?.imageRef).catch(() => {});
   state.referenceImage = null;
   state.referenceDraft = null;
   revokeEditReferencePreviewUrl();
@@ -4867,28 +5283,31 @@ referenceUpload.addEventListener("change", () => {
     return;
   }
 
-  state.referenceImage = {
-    file,
-    name: file.name || "reference.png"
-  };
-  revokeEditReferencePreviewUrl();
-
-  const reader = new FileReader();
-  reader.addEventListener("load", () => {
-    const preview = String(reader.result || "");
-    state.referenceDraft = preview.length <= maxSavedReferenceLength
-      ? {
-          kind: "data",
-          preview,
-          name: file.name || "reference.png",
-          type: file.type || "image/png"
-        }
-      : null;
-    updateReferencePreview(preview);
-    scheduleWorkspaceDraftSave();
-    showToast("参考图已载入");
-  });
-  reader.readAsDataURL(file);
+  (async () => {
+    try {
+      state.referenceImage = {
+        file,
+        name: file.name || "reference.png"
+      };
+      revokeEditReferencePreviewUrl();
+      const previousRef = state.referenceDraft?.imageRef;
+      const persisted = await persistImageSourceForDraft(file, "reference");
+      deletePersistedImageRef(previousRef).catch(() => {});
+      state.referenceDraft = {
+        kind: "object",
+        url: "",
+        preview: persisted.image || "",
+        imageRef: persisted.imageRef,
+        name: file.name || "reference.png",
+        type: file.type || "image/png"
+      };
+      updateReferencePreview(state.referenceDraft.preview);
+      flushWorkspaceDraftSave();
+      showToast("Reference image loaded");
+    } catch (error) {
+      showToast(error.message || "Reference upload failed", "error");
+    }
+  })();
 });
 
 mainPreview.addEventListener("load", () => {
@@ -5070,20 +5489,28 @@ document.addEventListener("click", scheduleWorkspaceDraftSave);
 window.addEventListener("resize", () => {
   updatePreviewAspectRatio(mainResolution.textContent);
 });
-window.addEventListener("beforeunload", saveWorkspaceDraft);
+window.addEventListener("beforeunload", flushWorkspaceDraftSave);
 
-syncPressedState($$(".segmented button, .template-grid button, .play-grid button, .chip-grid button, .quality-row button, .ratio-grid button"));
-updateBoardUi("commerce");
-updateModeUi();
-updatePlatformPreset();
-applyTemplate("main");
-restoreWorkspaceDraft();
-restoreLibraryCollapsed();
-getImageModel();
-updateCustomStyleUi();
-draftReady = true;
-renderWorkflowFeedback();
-updateStatus();
-checkApi();
-clearUntrustedAutofill();
-startHistorySync();
+async function boot() {
+  syncPressedState($$(".segmented button, .template-grid button, .play-grid button, .chip-grid button, .quality-row button, .ratio-grid button"));
+  updateBoardUi("commerce");
+  updateModeUi();
+  updatePlatformPreset();
+  applyTemplate("main");
+  await restoreWorkspaceDraft();
+  restoreLibraryCollapsed();
+  getImageModel();
+  updateCustomStyleUi();
+  draftReady = true;
+  renderWorkflowFeedback();
+  updateStatus();
+  checkApi();
+  clearUntrustedAutofill();
+  startHistorySync();
+}
+
+boot().catch((error) => {
+  console.warn("Boot failed:", error.message);
+  draftReady = true;
+  updateStatus();
+});
