@@ -11,11 +11,12 @@ const state = {
 
 const storageKeys = {
   apiKey: "tk-image-workbench-key",
+  apiBase: "tk-image-workbench-api-base",
   draft: "tk-image-workbench-draft-v2",
   libraryCollapsed: "tk-image-workbench-library-collapsed"
 };
 
-const fixedApiBase = "http://49.51.182.250:3000";
+const defaultApiBase = "http://49.51.182.250:3000";
 const fixedImageModel = "gpt-image-2";
 const maxSavedAssets = 30;
 const maxSavedReferenceLength = 900000;
@@ -189,9 +190,13 @@ function isUsableApiHost(hostname) {
     || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
 }
 
+function getConfiguredApiBase() {
+  return normalizeApiBase(apiBaseInput?.value) || normalizeApiBase(defaultApiBase);
+}
+
 if (apiBaseInput) {
-  apiBaseInput.value = fixedApiBase;
-  apiBaseInput.disabled = true;
+  const savedApiBase = normalizeApiBase(localStorage.getItem(storageKeys.apiBase));
+  apiBaseInput.value = savedApiBase || defaultApiBase;
 }
 const savedApiKey = sessionStorage.getItem(storageKeys.apiKey) || "";
 let apiKeyEdited = false;
@@ -511,8 +516,17 @@ function rememberApiKey() {
   }
 }
 
+function rememberApiBase() {
+  const value = normalizeApiBase(apiBaseInput?.value);
+  if (value) {
+    localStorage.setItem(storageKeys.apiBase, value);
+  } else {
+    localStorage.removeItem(storageKeys.apiBase);
+  }
+}
+
 function getApiBase() {
-  const base = normalizeApiBase(fixedApiBase);
+  const base = normalizeApiBase(apiBaseInput?.value);
   if (base) {
     return base;
   }
@@ -1144,7 +1158,7 @@ function sanitizeImageSource(value) {
   }
 
   try {
-    const parsed = new URL(raw, fixedApiBase);
+    const parsed = new URL(raw, getConfiguredApiBase());
     if (parsed.protocol === "http:" || parsed.protocol === "https:") {
       return parsed.toString();
     }
@@ -1165,8 +1179,10 @@ function getAssetImageKey(image, depth = 0) {
   }
 
   try {
-    const parsed = new URL(safeImage, fixedApiBase);
-    if (isGeneratedImagePath(parsed.pathname) || parsed.origin === fixedApiBase || parsed.origin === window.location.origin) {
+    const configuredBase = getConfiguredApiBase();
+    const configuredOrigin = new URL(configuredBase).origin;
+    const parsed = new URL(safeImage, configuredBase);
+    if (isGeneratedImagePath(parsed.pathname) || parsed.origin === configuredOrigin || parsed.origin === window.location.origin) {
       return `${parsed.pathname}${parsed.search}`;
     }
     return parsed.toString();
@@ -3241,14 +3257,16 @@ function getImageSourcePriority(image) {
   }
 
   try {
-    const parsed = new URL(safeImage, fixedApiBase);
-    if (parsed.origin === fixedApiBase && isGeneratedImagePath(parsed.pathname)) {
+    const configuredBase = getConfiguredApiBase();
+    const configuredOrigin = new URL(configuredBase).origin;
+    const parsed = new URL(safeImage, configuredBase);
+    if (parsed.origin === configuredOrigin && isGeneratedImagePath(parsed.pathname)) {
       return 5;
     }
     if (isGeneratedImagePath(parsed.pathname)) {
       return 4;
     }
-    if (parsed.origin === fixedApiBase || parsed.origin === window.location.origin) {
+    if (parsed.origin === configuredOrigin || parsed.origin === window.location.origin) {
       return 3;
     }
     return 2;
@@ -4227,8 +4245,9 @@ function getDownloadCandidates(url) {
   };
 
   try {
-    const parsed = new URL(url, fixedApiBase);
-    const sameOriginPath = new URL(`${parsed.pathname}${parsed.search}`, fixedApiBase).toString();
+    const configuredBase = getConfiguredApiBase();
+    const parsed = new URL(url, configuredBase);
+    const sameOriginPath = new URL(`${parsed.pathname}${parsed.search}`, configuredBase).toString();
 
     if (isGeneratedImagePath(parsed.pathname)) {
       addCandidate(sameOriginPath);
@@ -4253,9 +4272,10 @@ function getDirectDownloadUrl(url) {
   }
 
   try {
-    const parsed = new URL(safeUrl, fixedApiBase);
+    const configuredBase = getConfiguredApiBase();
+    const parsed = new URL(safeUrl, configuredBase);
     if (isGeneratedImagePath(parsed.pathname)) {
-      return new URL(`${parsed.pathname}${parsed.search}`, fixedApiBase).toString();
+      return new URL(`${parsed.pathname}${parsed.search}`, configuredBase).toString();
     }
     if (parsed.origin === window.location.origin) {
       return parsed.toString();
@@ -4273,7 +4293,7 @@ function isGeneratedImagePath(pathname = "") {
 
 function isSameOriginUrl(url) {
   try {
-    return new URL(url, fixedApiBase).origin === window.location.origin;
+    return new URL(url, getConfiguredApiBase()).origin === window.location.origin;
   } catch {
     return false;
   }
@@ -5204,7 +5224,11 @@ queueList.addEventListener("keydown", (event) => {
   toggleQueueSelection(item);
 });
 if (apiBaseInput) {
-  apiBaseInput.addEventListener("change", checkApi);
+  apiBaseInput.addEventListener("input", checkApi);
+  apiBaseInput.addEventListener("change", () => {
+    rememberApiBase();
+    checkApi();
+  });
 }
 apiKeyInput.addEventListener("input", () => {
   apiKeyEdited = true;
